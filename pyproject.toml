@@ -1,0 +1,22 @@
+[build-system]
+# scikit-build-core 驱动 csrc/CMakeLists.txt（pybind11 + pkg-config liburing）。
+# 仅在目标 Linux（liburing 可用）上可构建；macOS 等开发机只用纯 Python 控制面。
+requires = ["scikit-build-core>=0.8", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "uring-slab-tier"
+version = "0.1.0"
+description = "vLLM v0.24.0 的 uring-slab secondary tier（控制面 + io_uring DataEngine）"
+requires-python = ">=3.10"
+
+[tool.scikit-build]
+# CMakeLists 在 csrc/；install() 规则把 _uring_slab_engine 装进 uring_slab_tier/
+cmake.source-dir = "csrc"
+wheel.packages = ["uring_slab_tier"]
+# 非 Linux 上跳过 C++ 扩展，仍可安装纯 Python 控制面用于本地单测
+cmake.args = []
+
+[tool.scikit-build.cmake.define]
+# 供 CMake 定位安装目标目录
+URING_SLAB_INSTALL_DIR = "uring_slab_tier"

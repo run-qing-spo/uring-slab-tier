@@ -7,7 +7,13 @@ vLLM 启动配置（kv_connector_extra_config）示例：
       "spec_module_path": "uring_slab_tier.vllm_spec",
       "cpu_bytes_to_use": 4294967296,
       "secondary_tiers": [
-        {"type": "uring_slab", "disk_bytes_to_use": 107374182400}
+        {
+          "type": "uring_slab",
+          "disk_bytes_to_use": 107374182400,
+          "slab_path": "/mnt/nvme/uring_slab.bin",
+          "total_qd": 128,
+          "pending_capacity": 4096
+        }
       ]
     }
 

@@ -22,3 +22,10 @@ target_compile_options(
     -Wextra
     -Wpedantic
 )
+
+# scikit-build-core 按 install() 规则把扩展打进 wheel。
+# 装入 uring_slab_tier/ 包内，供 `from uring_slab_tier import _uring_slab_engine`。
+if(NOT DEFINED URING_SLAB_INSTALL_DIR)
+  set(URING_SLAB_INSTALL_DIR uring_slab_tier)
+endif()
+install(TARGETS _uring_slab_engine LIBRARY DESTINATION ${URING_SLAB_INSTALL_DIR})

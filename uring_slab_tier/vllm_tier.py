@@ -1,14 +1,27 @@
-"""vLLM v0.24.0 SecondaryTierManager 到 uring-slab 控制面的 adapter。
+"""vLLM v0.24.0 SecondaryTierManager adapter + uring-slab DataEngine 绑定层。
 
-只做一件事：把 SecondaryTierManager 的调用翻译成控制面调用，参数原样
-传递、不传漏。不做 I/O，不经手 BlockIo——BlockIo/BlockCompletion 是
-控制面与 DataEngine 之间的边界，与本 adapter 无关。
+两件事：
+
+1. adapter：把 SecondaryTierManager 的调用翻译成控制面调用（参数原样传递、
+   不传漏）；
+2. 绑定层：把控制面 submit_* 产出的 block 四元组逐条喂给 C++ DataEngine，
+   并把 DataEngine 的 completion 逐条经 complete_block 喂回控制面。
+
+数据流：
+
+    scheduler → submit_store/load → 控制面分配 slot、返回四元组
+                                  → engine.submit_store/load 逐 block 下发
+    engine 完成 → poll_completions() → 控制面 complete_block → get_finished_jobs
 
 上游锁定 commit：ee0da84ab9e04ac7610e28580af62c365e898389（v0.24.0）。
-所有方法都在 scheduler 线程调用；lookup 纯同步（索引就在控制面内存里），
-submit_* 只做有界元数据工作，运行期可预期失败（in-flight duplicate、
-容量不足、submit 时 key 已失效）由控制面转成一次
-JobResult(success=False)，绝不从 submit_* 抛出。
+所有方法都在 scheduler 线程调用；lookup 纯同步。DataEngine 自带 owner 线程
+独占 io_uring，completion 通过 poll/drain 拉取，本 adapter 只在单一 scheduler
+线程里泵送，不引入额外并发。运行期可预期失败（duplicate、容量不足、submit
+时 key 已失效、engine 队列满回 EAGAIN）都转成 JobResult(success=False)。
+
+key 账本键：v0.24.0 的 OffloadKey 明确是 bytes，DataEngine 按 bytes 收发并
+原样回传，控制面亦以它为账本键。_encode_key 是唯一卡点，只做严格类型校验：
+非 bytes 即上游契约被破坏，fail-fast。
 """
 
 from vllm.logger import init_logger
@@ -23,22 +36,49 @@ from uring_slab_tier.manager import (
     ContractViolationError,
     IoDirection,
     JobMetadata as CpJobMetadata,
-    JobResult as CpJobResult,
     UringSlabControlPlane,
 )
+
+try:
+    from uring_slab_tier import _uring_slab_engine
+except ImportError as exc:  # 扩展未编译（如非 Linux 开发机）
+    _uring_slab_engine = None
+    _ENGINE_IMPORT_ERROR: ImportError | None = exc
+else:
+    _ENGINE_IMPORT_ERROR = None
 
 logger = init_logger(__name__)
 
 
+def _encode_key(key: OffloadKey) -> bytes:
+    """校验 OffloadKey 为 bytes 并原样返回（DataEngine 与控制面共用的账本键）。
+
+    v0.24.0 的 OffloadKey 明确是 bytes；DataEngine 按 bytes 收发并原样回传，
+    控制面亦以它为账本键。非 bytes 即上游契约被破坏，fail-fast，绝不用
+    repr() 之类兜底把类型错误糊成一个能跑但对不上账的 key。
+    """
+    if isinstance(key, bytes):
+        return key
+    raise ContractViolationError(
+        f"OffloadKey 必须是 bytes（v0.24.0 契约），得到 {type(key).__name__}"
+    )
+
+
 class UringSlabSecondaryTierManager(SecondaryTierManager):
-    """uring-slab secondary tier（当前形态：控制面账本，DataEngine 后续绑定）。
+    """uring-slab secondary tier：控制面账本 + C++ io_uring DataEngine。
 
     secondary_tiers 配置示例：
 
-        {"type": "uring_slab", "disk_bytes_to_use": 107374182400}
+        {
+          "type": "uring_slab",
+          "disk_bytes_to_use": 107374182400,
+          "slab_path": "/mnt/nvme/uring_slab.bin",
+          "total_qd": 128,
+          "pending_capacity": 4096
+        }
 
-    slot_bytes 取 primary_kv_view.strides[0]（一个 offloaded block 的对齐后
-    字节跨度），slot_capacity = disk_bytes_to_use // slot_bytes。
+    slot_bytes 取 primary_kv_view.strides[0]；slot_capacity =
+    disk_bytes_to_use // slot_bytes；slab 恰好铺 slot_capacity 个 slot。
     """
 
     def __init__(
@@ -47,6 +87,9 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         disk_bytes_to_use: int,
+        slab_path: str,
+        total_qd: int = 128,
+        pending_capacity: int = 4096,
     ) -> None:
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -57,18 +100,35 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
             raise ValueError(
                 f"disk_bytes_to_use 必须是正整数字节数，得到 {disk_bytes_to_use!r}"
             )
+        if not slab_path:
+            raise ValueError("slab_path 不能为空")
+        if _uring_slab_engine is None:
+            raise RuntimeError(
+                "_uring_slab_engine 未编译——需在目标 Linux 上构建 csrc/"
+            ) from _ENGINE_IMPORT_ERROR
+
         self._slot_bytes: int = primary_kv_view.strides[0]
         # slot_capacity < 1（预算小于一个 slot）时控制面构造抛错，启动失败
-        self._cp = UringSlabControlPlane(
-            slot_capacity=disk_bytes_to_use // self._slot_bytes
+        slot_capacity = disk_bytes_to_use // self._slot_bytes
+        self._cp = UringSlabControlPlane(slot_capacity=slot_capacity)
+        # slab 恰好铺 slot_capacity 个 slot：是 slot_bytes 的整数倍，满足引擎
+        # 「slab_bytes % block_size == 0」约束，且与控制面 slot 数一致
+        slab_bytes = slot_capacity * self._slot_bytes
+        self._engine = _uring_slab_engine.DataEngine(
+            primary_kv_view,
+            slab_path,
+            slab_bytes,
+            total_qd=total_qd,
+            pending_capacity=pending_capacity,
         )
         # drain_jobs 提前收割的 terminal 结果，等下一次 get_finished_jobs 交付
-        self._pending_results: list[CpJobResult] = []
+        self._pending_results: list = []
         self._closed = False
         logger.info(
-            "uring-slab tier 已创建：slot_bytes=%d, slot_capacity=%d",
+            "uring-slab tier 已创建：slot_bytes=%d, slot_capacity=%d, slab_path=%s",
             self._slot_bytes,
-            self._cp.slot_capacity,
+            slot_capacity,
+            slab_path,
         )
 
     # ------------------------------------------------------------------
@@ -77,7 +137,7 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """纯同步三态：True=resident；None=store 在途；False=miss。"""
-        return self._cp.lookup(key)
+        return self._cp.lookup(_encode_key(key))
 
     # touch：继承基类 no-op —— v1 无 eviction/LRU，无热度可更新。
 
@@ -102,18 +162,28 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
 
         cp_job = CpJobMetadata(
             job_id=job_metadata.job_id,
-            keys=tuple(job_metadata.keys),
+            keys=tuple(_encode_key(k) for k in job_metadata.keys),
             primary_slots=tuple(int(b) for b in job_metadata.block_ids),
             direction=IoDirection.LOAD if expected_promotion else IoDirection.STORE,
         )
-        # 当前控制面只登记账本、不产出 BlockIo；下发给 DataEngine 的 I/O 与
-        # completion 回路由后续 engine 绑定层接入
+        # 控制面分配 slot 并返回 (job_id, key, primary_slot, secondary_slot)；
+        # 逐 block 下发给 DataEngine。key 已是 bytes，引擎收发一致。
         if expected_promotion:
-            self._cp.submit_load(cp_job)
+            assignments = self._cp.submit_load(cp_job)
+            for job_id, key, primary_slot, secondary_slot in assignments:
+                self._engine.submit_load(job_id, key, primary_slot, secondary_slot)
         else:
-            self._cp.submit_store(cp_job)
+            assignments = self._cp.submit_store(cp_job)
+            for job_id, key, primary_slot, secondary_slot in assignments:
+                self._engine.submit_store(job_id, key, primary_slot, secondary_slot)
+
+    def _pump_completions(self) -> None:
+        """把 DataEngine 已完成的 block 逐条喂回控制面。"""
+        for job_id, key, success, _error_code in self._engine.poll_completions():
+            self._cp.complete_block(job_id, key, success)
 
     def get_finished_jobs(self) -> list[JobResult]:
+        self._pump_completions()
         results = self._pending_results + self._cp.get_finished_jobs()
         self._pending_results = []
         return [
@@ -133,36 +203,39 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
     # on_schedule_end：继承基类 no-op —— lookup 同步、无延迟提交。
 
     def has_pending_work(self) -> bool:
-        return bool(self._pending_results) or self._cp.has_pending_jobs()
+        return (
+            bool(self._pending_results)
+            or self._cp.has_pending_jobs()
+            or self._engine.has_pending_work()
+        )
 
     # ------------------------------------------------------------------
     # drain · 关闭
     # ------------------------------------------------------------------
 
     def drain_jobs(self) -> None:
-        """等所有已提交 job terminal。
+        """等所有已提交 block terminal，再把结果收进待交付缓冲。
 
-        先把已 terminal 的结果收进待交付缓冲（仍由之后的
-        get_finished_jobs() 交付，exactly-once 不变）；收完后控制面仍有
-        job，说明存在在途 block I/O——当前无 DataEngine 绑定，无人能使其
-        terminal，fail-fast。engine 绑定层就绪后由其接管真正的阻塞等待。
+        engine.drain() 阻塞至所有已接受 block 完成，并消费式返回尚未 poll 的
+        completion；逐条喂回控制面后，本地失败与 I/O 完成的 job 都已 terminal，
+        由之后的 get_finished_jobs() 交付（exactly-once 不变）。
         """
+        for job_id, key, success, _error_code in self._engine.drain():
+            self._cp.complete_block(job_id, key, success)
         self._pending_results.extend(self._cp.get_finished_jobs())
         if self._cp.has_pending_jobs():
             raise RuntimeError(
-                "uring-slab tier 无法 drain：存在在途 block I/O，"
-                "但 DataEngine 尚未绑定"
+                "uring-slab tier drain 后仍有未 terminal job（completion 契约异常）"
             )
 
     def shutdown(self) -> None:
-        """阻止新提交；当前形态无线程/fd 可关，残留 job 仅告警。"""
+        """阻止新提交并停引擎：engine.shutdown() 完成已接受任务并 join owner。"""
         self._closed = True
+        self._engine.shutdown()
         pending = self._cp.stats().pending_jobs
         if pending:
             logger.warning(
-                "uring-slab tier shutdown 时仍有 %d 个未收割 job"
-                "（无 DataEngine 形态下在途 I/O 不会再 terminal）",
-                pending,
+                "uring-slab tier shutdown 时仍有 %d 个未收割 job", pending
             )
 
     # ------------------------------------------------------------------
@@ -171,5 +244,10 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
 
     @property
     def control_plane(self) -> UringSlabControlPlane:
-        """DataEngine 绑定层与实验 harness 由此对接控制面。"""
+        """实验 harness 由此对接控制面账本。"""
         return self._cp
+
+    @property
+    def data_engine(self):
+        """实验 harness 由此对接 DataEngine（QD、pending 观测）。"""
+        return self._engine
