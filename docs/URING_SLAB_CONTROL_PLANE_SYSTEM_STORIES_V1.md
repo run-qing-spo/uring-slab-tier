@@ -2,6 +2,9 @@
 
 范围：vLLM `v0.24.0`、`BLOCK_LEVEL`、单个 secondary tier。
 
+第一版与原生 FS 一样不做容量 eviction。slab 必须覆盖正式 run 的全部唯一
+blocks；容量耗尽时新 store failure，不覆盖已有 resident blocks。
+
 ## 正常 scheduler 流程
 
 1. 新请求到达  
@@ -76,9 +79,9 @@ blocks 可以继续保留。
 ## 必须成立
 
 ```text
-block 有 active job  => 不可逐出
 job terminal         => 该 job 已无 I/O
 每个 accepted job    => 恰好一个 completion
 store 部分失败       => 保留成功 blocks，job failure
 load 部分失败        => primary 整批失败，job failure
+resident block       => 不因容量压力被逐出
 ```
