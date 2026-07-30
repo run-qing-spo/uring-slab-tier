@@ -6,6 +6,7 @@
 #include <linux/stat.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -88,50 +89,29 @@ DataEngine::DataEngine(void* primary_base,
         "pending_capacity 不能小于 total_qd");
   }
 
-  InitializeSlabAndRing();
+  contexts_.reserve(total_qd_);
+  free_contexts_.reserve(total_qd_);
+  for (std::size_t i = 0; i < total_qd_; ++i) {
+    contexts_.push_back(std::make_unique<RequestContext>());
+    free_contexts_.push_back(contexts_.back().get());
+  }
 
-  try {
-    contexts_.reserve(total_qd_);
-    free_contexts_.reserve(total_qd_);
-    for (std::size_t i = 0; i < total_qd_; ++i) {
-      contexts_.push_back(std::make_unique<RequestContext>());
-      free_contexts_.push_back(contexts_.back().get());
-    }
-    owner_ = std::thread(&DataEngine::OwnerLoop, this);
-  } catch (...) {
-    if (fixed_file_registered_) {
-      io_uring_unregister_files(ring_);
-    }
-    io_uring_queue_exit(ring_);
-    delete ring_;
-    ring_ = nullptr;
-    close(wake_fd_);
-    wake_fd_ = -1;
-    close(slab_fd_);
-    slab_fd_ = -1;
-    throw;
+  owner_ = std::thread(&DataEngine::OwnerLoop, this);
+
+  // owner 负责创建 slab 和 ring；构造线程等待其初始化完成，避免把一个
+  // 半初始化的 Engine 暴露给 Python。
+  std::unique_lock<std::mutex> lock(mutex_);
+  startup_cv_.wait(lock, [this] { return startup_complete_; });
+  if (startup_error_ != nullptr) {
+    std::exception_ptr error = startup_error_;
+    lock.unlock();
+    owner_.join();
+    std::rethrow_exception(error);
   }
 }
 
 DataEngine::~DataEngine() {
   Shutdown();
-  if (fixed_file_registered_) {
-    io_uring_unregister_files(ring_);
-    fixed_file_registered_ = false;
-  }
-  if (ring_ != nullptr) {
-    io_uring_queue_exit(ring_);
-    delete ring_;
-    ring_ = nullptr;
-  }
-  if (wake_fd_ >= 0) {
-    close(wake_fd_);
-    wake_fd_ = -1;
-  }
-  if (slab_fd_ >= 0) {
-    close(slab_fd_);
-    slab_fd_ = -1;
-  }
 }
 
 void DataEngine::InitializeSlabAndRing() {
@@ -139,6 +119,15 @@ void DataEngine::InitializeSlabAndRing() {
       open(slab_path_.c_str(), O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
   if (slab_fd_ < 0) {
     throw SystemError("打开 slab", errno);
+  }
+
+  // V1 不允许两个 Engine 同时使用同一路径。锁必须在截断前取得；进程退出
+  // 或 fd 关闭时内核自动释放锁。
+  if (flock(slab_fd_, LOCK_EX | LOCK_NB) != 0) {
+    const int error = errno;
+    close(slab_fd_);
+    slab_fd_ = -1;
+    throw SystemError("独占锁定 slab", error);
   }
 
   // V1 每次构造都创建全新 slab。先截断以清除旧 extent/数据映射，
@@ -175,8 +164,10 @@ void DataEngine::InitializeSlabAndRing() {
 
   ring_ = new io_uring{};
   io_uring_params params{};
-  params.flags =
-      IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
+  // ring 在 owner 线程创建，后续也只有 owner 提交，因此可以安全声明
+  // SINGLE_ISSUER。
+  params.flags = IORING_SETUP_SINGLE_ISSUER |
+                 IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
   params.cq_entries = RingEntries(total_qd_ * 2, "CQ 容量");
   const unsigned sq_entries = RingEntries(total_qd_, "SQ 容量");
   const int ring_error = io_uring_queue_init_params(sq_entries, ring_, &params);
@@ -202,6 +193,27 @@ void DataEngine::InitializeSlabAndRing() {
     throw SystemError("io_uring_register_files", -register_error);
   }
   fixed_file_registered_ = true;
+}
+
+void DataEngine::DestroySlabAndRing() noexcept {
+  // 本函数只由 owner 调用，与创建资源的线程保持一致。
+  if (fixed_file_registered_) {
+    io_uring_unregister_files(ring_);
+    fixed_file_registered_ = false;
+  }
+  if (ring_ != nullptr) {
+    io_uring_queue_exit(ring_);
+    delete ring_;
+    ring_ = nullptr;
+  }
+  if (wake_fd_ >= 0) {
+    close(wake_fd_);
+    wake_fd_ = -1;
+  }
+  if (slab_fd_ >= 0) {
+    close(slab_fd_);  // 同时释放 flock 独占锁。
+    slab_fd_ = -1;
+  }
 }
 
 void DataEngine::ValidateGeometry() const {
@@ -353,6 +365,25 @@ DataEngine::RequestContext* DataEngine::AcquireContextLocked() {
 }
 
 void DataEngine::OwnerLoop() {
+  try {
+    InitializeSlabAndRing();
+  } catch (...) {
+    DestroySlabAndRing();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      startup_error_ = std::current_exception();
+      startup_complete_ = true;
+    }
+    startup_cv_.notify_one();
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    startup_complete_ = true;
+  }
+  startup_cv_.notify_one();
+
   for (;;) {
     ReapAvailable();
     DispatchAvailable();
@@ -360,7 +391,7 @@ void DataEngine::OwnerLoop() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_ && accepted_not_completed_ == 0) {
-        return;
+        break;
       }
     }
 
@@ -379,6 +410,8 @@ void DataEngine::OwnerLoop() {
       DrainWakeFd();
     }
   }
+
+  DestroySlabAndRing();
 }
 
 void DataEngine::DispatchAvailable() {

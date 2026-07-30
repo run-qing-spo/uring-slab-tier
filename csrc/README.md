@@ -3,7 +3,8 @@
 ## 所有权
 
 - pybind 包装层持有 `primary_kv_view` 的强引用。
-- `DataEngine` 负责创建、截断、预分配、打开、注册和关闭 slab 文件。
+- owner 线程负责创建、锁定、截断、预分配、打开、注册和关闭 slab 文件，
+  同时负责创建与销毁 io_uring。
 - `shutdown()` 会等待 ring owner 线程退出；返回后不再有请求访问 primary
   内存。
 
@@ -34,7 +35,8 @@ SQ 和 CQ 不按 load/store 静态分区。SQ 容量覆盖 `total_qd`，CQ 容�
 ## Linux 特性
 
 - 单个 owner 线程独占 ring 的提交和收割。
-- 使用 `IORING_SETUP_SINGLE_ISSUER` 和 `IORING_SETUP_SUBMIT_ALL`。
+- 使用 `IORING_SETUP_SINGLE_ISSUER` 和 `IORING_SETUP_SUBMIT_ALL`；ring
+  与所有 SQE 都由同一个 owner 线程创建和提交。
 - 不使用 `IORING_SETUP_SQPOLL`。
 - slab fd 注册为 fixed file 的第 0 项。
 - primary 内存不注册为 fixed buffer。

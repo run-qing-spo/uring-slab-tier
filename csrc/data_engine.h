@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -85,6 +86,7 @@ class DataEngine {
   };
 
   void InitializeSlabAndRing();
+  void DestroySlabAndRing() noexcept;
   void ValidateGeometry() const;
   void ValidateTask(const BlockIo& task) const;
   void WakeOwner() noexcept;
@@ -115,6 +117,7 @@ class DataEngine {
   bool fixed_file_registered_ = false;
 
   mutable std::mutex mutex_;
+  std::condition_variable startup_cv_;
   std::condition_variable idle_cv_;
   std::deque<BlockIo> load_pending_;
   std::deque<BlockIo> store_pending_;
@@ -126,6 +129,8 @@ class DataEngine {
   std::size_t store_in_flight_ = 0;
   std::size_t accepted_not_completed_ = 0;
 
+  bool startup_complete_ = false;
+  std::exception_ptr startup_error_;
   bool stopping_ = false;
   std::thread owner_;
 };
