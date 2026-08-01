@@ -285,6 +285,20 @@ class UringSlabControlPlane:
         """存在尚未被 get_finished_jobs() 取走的 job（含待收割项）。"""
         return bool(self._jobs)
 
+    def clear_residency(self) -> None:
+        """在 drain 并收割全部 job 后清空 resident 账本。
+
+        物理 slab 不清零；清空 key→slot 关系后 lookup 会立即 miss，slot
+        分配游标回到 0，使后续 store 从头覆盖旧数据。
+        """
+        if self._key2inflight_store:
+            raise RuntimeError("存在 in-flight store，不能清空 resident 账本")
+        if self._jobs:
+            raise RuntimeError("存在未收割 job，不能清空 resident 账本")
+
+        self._key2slot.clear()
+        self._next_slot_id = 0
+
     # ------------------------------------------------------------------
     # 观测
     # ------------------------------------------------------------------

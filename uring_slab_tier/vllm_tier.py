@@ -228,6 +228,13 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
                 "uring-slab tier drain 后仍有未 terminal job（completion 契约异常）"
             )
 
+    def clear_residency(self) -> bool:
+        """清空 secondary resident 账本；调用方必须先完成 drain。"""
+        if self._engine.has_pending_work():
+            raise RuntimeError("DataEngine 仍有 pending work，不能清空 resident 账本")
+        self._cp.clear_residency()
+        return True
+
     def shutdown(self) -> None:
         """阻止新提交并停引擎：engine.shutdown() 完成已接受任务并 join owner。"""
         self._closed = True
