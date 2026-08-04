@@ -36,6 +36,7 @@ configure_experiment() {
   PROMPTS_PATH="${PROMPTS_PATH:-$RESULTS_ROOT/prompts.jsonl}"
   PROMPT_GENERATOR="${PROMPT_GENERATOR:-$script_dir/generate_none_prompts.py}"
   CLOSED_LOOP_CLIENT="${CLOSED_LOOP_CLIENT:-$script_dir/run_closed_loop_client.py}"
+  QUALIFICATION_TOOL="${QUALIFICATION_TOOL:-$script_dir/qualify_none_results.py}"
   mkdir -p "$RESULTS_ROOT"
 
   [[ -d "$VLLM_REPO/vllm" ]] || {
@@ -67,6 +68,10 @@ configure_experiment() {
   }
   [[ -f "$CLOSED_LOOP_CLIENT" ]] || {
     echo "找不到闭环客户端：$CLOSED_LOOP_CLIENT" >&2
+    return 1
+  }
+  [[ -f "$QUALIFICATION_TOOL" ]] || {
+    echo "找不到 none 资格检查工具：$QUALIFICATION_TOOL" >&2
     return 1
   }
 }
@@ -290,14 +295,45 @@ run_concurrency_sweep() {
 # ---------- 收尾与资格判断 ----------
 
 finalize_results() {
-  # TODO：归档客户端结果、server JSONL、server 日志和每个并发点的配置。
-  return 0
+  local archive="${RESULTS_ROOT}.tar.gz"
+  local results_parent
+  local results_name
+  results_parent=$(dirname "$RESULTS_ROOT")
+  results_name=$(basename "$RESULTS_ROOT")
+
+  {
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'model_snapshot=%s\n' "$MODEL_SNAPSHOT"
+    printf 'served_model_name=%s\n' "$SERVED_MODEL_NAME"
+    printf 'prompt_count=%s\n' "$PROMPT_COUNT"
+    printf 'prompt_tokens=%s\n' "$PROMPT_TOKENS"
+    printf 'output_tokens=%s\n' "$OUTPUT_TOKENS"
+    printf 'primary_bytes=%s\n' "$PRIMARY_BYTES"
+    printf 'block_size=%s\n' "$BLOCK_SIZE"
+    printf 'concurrencies=1,2,4,8\n'
+    printf 'vllm_commit=%s\n' "$(git -C "$VLLM_REPO" rev-parse HEAD)"
+  } >"$RESULTS_ROOT/configuration.txt"
+
+  (
+    cd "$RESULTS_ROOT"
+    find . -type f ! -name SHA256SUMS -print0 \
+      | sort -z \
+      | xargs -0 sha256sum >SHA256SUMS
+  )
+  tar -C "$results_parent" -czf "$archive" "$results_name"
+  echo "结果已归档：$archive"
 }
 
 check_none_qualification() {
-  # TODO：硬性检查请求失败、新 JIT、preemption、primary reservation failure
-  # 和非预期 cache hit 均为零；再判断队列是否持续增长及 TTFT 是否异常抬升。
-  return 0
+  "$VLLM_PYTHON" "$QUALIFICATION_TOOL" \
+    --results "$RESULTS_ROOT" \
+    --concurrencies 1 2 4 8 \
+    --prompt-tokens "$PROMPT_TOKENS" \
+    --block-size "$BLOCK_SIZE"
+
+  "$VLLM_PYTHON" -c \
+    'import json, sys; raise SystemExit(0 if json.load(open(sys.argv[1], encoding="utf-8"))["passed"] else 1)' \
+    "$RESULTS_ROOT/qualification.json"
 }
 
 
@@ -332,8 +368,10 @@ main() {
     stop_none_server "$concurrency"
   done
 
+  local qualification_status=0
+  check_none_qualification || qualification_status=$?
   finalize_results
-  check_none_qualification
+  return "$qualification_status"
 }
 
-# 当前文件仅为待审核骨架，暂不调用 main，避免误启动实验。
+main "$@"
