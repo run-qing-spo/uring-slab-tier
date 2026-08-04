@@ -200,16 +200,30 @@ run_warmup() {
 }
 
 reset_before_measurement() {
-  # TODO：等待请求 drain，通过 external reset 清 GPU prefix cache 和 CPU primary。
-  return 0
+  local concurrency="$1"
+
+  # run_warmup 返回时所有客户端请求均已结束；external reset 同时清本地
+  # GPU prefix cache 和 connector 管理的 CPU primary。
+  curl --fail --silent --show-error \
+    --request POST \
+    "http://127.0.0.1:$PORT/reset_prefix_cache?reset_external=true" \
+    >/dev/null
+  echo "预热缓存已清理：concurrency=$concurrency"
 }
 
 
 # ---------- 独立监控窗口 ----------
 
 begin_measurement_window() {
-  # TODO：通知 server 开始正式 JSONL 窗口，并记录 Prometheus 起点快照。
-  return 0
+  local concurrency="$1"
+  local window_id="none-c$concurrency"
+
+  curl --fail --silent --show-error \
+    --request POST \
+    "http://127.0.0.1:$PORT/tiering_monitor/start_window?window_id=$window_id" \
+    >/dev/null
+  printf '%s\n' "$window_id" >"$SERVER_POINT_DIR/window-id.txt"
+  echo "正式监控窗口已开启：window_id=$window_id"
 }
 
 sample_server_metrics() {
@@ -218,8 +232,25 @@ sample_server_metrics() {
 }
 
 end_measurement_window() {
-  # TODO：等待本点请求与 GPU→CPU store 完成，再保存窗口终点和累计值差分。
-  return 0
+  local concurrency="$1"
+  local summary="$SERVER_POINT_DIR/server-window-summary.json"
+  local temporary="$summary.tmp"
+
+  if ! curl --fail --silent --show-error \
+    --request POST \
+    "http://127.0.0.1:$PORT/tiering_monitor/end_window" \
+    --output "$temporary"; then
+    unlink "$temporary" 2>/dev/null || true
+    return 1
+  fi
+  if ! "$VLLM_PYTHON" -c \
+    'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); assert data["window_id"] == sys.argv[2]' \
+    "$temporary" "none-c$concurrency"; then
+    unlink "$temporary" 2>/dev/null || true
+    return 1
+  fi
+  mv "$temporary" "$summary"
+  echo "正式监控窗口已结束：concurrency=$concurrency，汇总=$summary"
 }
 
 
