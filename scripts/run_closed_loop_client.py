@@ -125,10 +125,6 @@ async def run(args: argparse.Namespace) -> int:
     if args.concurrency <= 0 or args.max_tokens <= 0:
         raise ValueError("concurrency 和 max-tokens 必须为正数")
     prompts = load_prompts(Path(args.prompts))
-    queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
-    for sequence, prompt in enumerate(prompts):
-        queue.put_nowait((sequence, prompt))
-
     results: list[dict[str, Any]] = []
     results_lock = asyncio.Lock()
     active_requests = 0
@@ -137,14 +133,13 @@ async def run(args: argparse.Namespace) -> int:
     timeout = httpx.Timeout(args.timeout_seconds)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
+        worker_count = min(args.concurrency, len(prompts))
 
         async def worker(worker_id: int) -> None:
             nonlocal active_requests, in_flight_peak
-            while True:
-                try:
-                    sequence, prompt = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
+            # 固定按 worker 切分，保证预热和正式阶段每个发送端顺序一致。
+            for sequence in range(worker_id, len(prompts), worker_count):
+                prompt = prompts[sequence]
                 started = time.perf_counter()
                 active_requests += 1
                 in_flight_peak = max(in_flight_peak, active_requests)
@@ -187,11 +182,10 @@ async def run(args: argparse.Namespace) -> int:
                     )
                 async with results_lock:
                     results.append(result)
-                queue.task_done()
 
         workers = [
             asyncio.create_task(worker(worker_id))
-            for worker_id in range(min(args.concurrency, len(prompts)))
+            for worker_id in range(worker_count)
         ]
         await asyncio.gather(*workers)
 

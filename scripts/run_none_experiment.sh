@@ -195,8 +195,8 @@ prepare_prompts() {
 }
 
 run_warmup() {
-  # TODO：使用与正式阶段相同的请求形状完成 JIT 和运行时预热。
-  return 0
+  local concurrency="$1"
+  run_closed_loop_phase "$concurrency" warmup
 }
 
 reset_before_measurement() {
@@ -225,10 +225,11 @@ end_measurement_window() {
 
 # ---------- 正式闭环测试 ----------
 
-run_one_concurrency() {
+run_closed_loop_phase() {
   local concurrency="$1"
-  local output="$SERVER_POINT_DIR/client-measurement.jsonl"
-  local summary="$SERVER_POINT_DIR/client-measurement-summary.json"
+  local phase="$2"
+  local output="$SERVER_POINT_DIR/client-$phase.jsonl"
+  local summary="$SERVER_POINT_DIR/client-$phase-summary.json"
 
   env PYTHONHASHSEED=0 \
     "$VLLM_PYTHON" "$CLOSED_LOOP_CLIENT" \
@@ -239,9 +240,14 @@ run_one_concurrency() {
       --concurrency "$concurrency" \
       --max-tokens "$OUTPUT_TOKENS" \
       --timeout-seconds "$CLIENT_TIMEOUT_SECONDS" \
-      --phase measurement >"$summary"
+      --phase "$phase" >"$summary"
 
-  echo "闭环请求完成：concurrency=$concurrency，结果=$output"
+  echo "闭环请求完成：phase=$phase，concurrency=$concurrency，结果=$output"
+}
+
+run_one_concurrency() {
+  local concurrency="$1"
+  run_closed_loop_phase "$concurrency" measurement
 }
 
 run_concurrency_sweep() {
