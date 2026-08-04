@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -Eeuo pipefail
+
 # none 实验只用于确认基础 server 在目标并发下没有先出现原生瓶颈，
 # 不参与 FS 与 uring-slab 的性能对比。正式 workload 固定 128-token prompt
 # 和 1-token output，只扫描并发 1、2、4、8。
@@ -8,6 +10,9 @@
 # ---------- 固定配置 ----------
 
 configure_experiment() {
+  local script_dir
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
   VLLM_REPO="${VLLM_REPO:-/home/adminz/uring-slab-experiments/repos/vllm-0.24.0}"
   VLLM_PYTHON="${VLLM_PYTHON:-/home/adminz/uring-slab-experiments/venvs/vllm024-cu129-clean/bin/python}"
   MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-/home/adminz/.cache/huggingface/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6}"
@@ -21,9 +26,13 @@ configure_experiment() {
   MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
   MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
   SERVER_READY_TIMEOUT_SECONDS="${SERVER_READY_TIMEOUT_SECONDS:-180}"
+  PROMPT_COUNT="${PROMPT_COUNT:-128}"
+  PROMPT_TOKENS="${PROMPT_TOKENS:-128}"
 
   RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
   RESULTS_ROOT="${RESULTS_ROOT:-$PWD/results/none/$RUN_ID}"
+  PROMPTS_PATH="${PROMPTS_PATH:-$RESULTS_ROOT/prompts.jsonl}"
+  PROMPT_GENERATOR="${PROMPT_GENERATOR:-$script_dir/generate_none_prompts.py}"
   mkdir -p "$RESULTS_ROOT"
 
   [[ -d "$VLLM_REPO/vllm" ]] || {
@@ -40,6 +49,17 @@ configure_experiment() {
   }
   [[ -f "$MODEL_SNAPSHOT/pytorch_model.bin" ]] || {
     echo "本地模型权重不存在：$MODEL_SNAPSHOT/pytorch_model.bin" >&2
+    return 1
+  }
+  local tokenizer_file
+  for tokenizer_file in tokenizer_config.json vocab.json merges.txt; do
+    [[ -f "$MODEL_SNAPSHOT/$tokenizer_file" ]] || {
+      echo "本地 tokenizer 文件不存在：$MODEL_SNAPSHOT/$tokenizer_file" >&2
+      return 1
+    }
+  done
+  [[ -f "$PROMPT_GENERATOR" ]] || {
+    echo "找不到 prompt 生成器：$PROMPT_GENERATOR" >&2
     return 1
   }
 }
@@ -147,9 +167,24 @@ stop_none_server() {
 # ---------- Workload 准备 ----------
 
 prepare_prompts() {
-  # TODO：生成固定的一组 128-token prompts；同一点内每条只发送一次，
-  # 不循环制造 GPU/CPU prefix hit；不同并发点在 reset 后重放同一组。
-  return 0
+  env \
+    PYTHONHASHSEED=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    "$VLLM_PYTHON" "$PROMPT_GENERATOR" \
+      --model-snapshot "$MODEL_SNAPSHOT" \
+      --output "$PROMPTS_PATH" \
+      --count "$PROMPT_COUNT" \
+      --tokens "$PROMPT_TOKENS" \
+      --block-size "$BLOCK_SIZE"
+
+  local actual_count
+  actual_count=$(wc -l <"$PROMPTS_PATH")
+  [[ "$actual_count" -eq "$PROMPT_COUNT" ]] || {
+    echo "prompt JSONL 行数错误：expected=$PROMPT_COUNT, actual=$actual_count" >&2
+    return 1
+  }
+  echo "固定 prompt 集合已就绪：$PROMPTS_PATH"
 }
 
 run_warmup() {
