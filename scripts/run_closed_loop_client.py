@@ -58,6 +58,7 @@ async def send_one(
     finish_reason: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    http_status: int | None = None
     chunks = 0
     payload = {
         "model": model,
@@ -72,6 +73,7 @@ async def send_one(
         async with client.stream(
             "POST", f"{base_url.rstrip('/')}/v1/completions", json=payload
         ) as response:
+            http_status = response.status_code
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -96,8 +98,11 @@ async def send_one(
         request_end = time.perf_counter()
         if first_token_at is None:
             raise RuntimeError("stream 正常结束，但没有收到输出 token")
+        if prompt_tokens is None or completion_tokens is None:
+            raise RuntimeError("stream 正常结束，但服务端没有返回 usage token 统计")
         return {
             "ok": True,
+            "http_status": http_status,
             "response_id": response_id,
             "ttft_seconds": first_token_at - request_start,
             "latency_seconds": request_end - request_start,
@@ -109,6 +114,7 @@ async def send_one(
     except Exception as exc:
         return {
             "ok": False,
+            "http_status": http_status,
             "latency_seconds": time.perf_counter() - request_start,
             "error_type": type(exc).__name__,
             "error": str(exc),
@@ -163,6 +169,22 @@ async def run(args: argparse.Namespace) -> int:
                         "started_after_run_seconds": started - run_start,
                     }
                 )
+                if result["ok"] and (
+                    result["prompt_tokens"] != prompt.get("token_count")
+                    or result["completion_tokens"] != args.max_tokens
+                ):
+                    result.update(
+                        {
+                            "ok": False,
+                            "error_type": "TokenCountMismatch",
+                            "error": (
+                                "服务端 token 数与 workload 配置不一致："
+                                f"prompt={result['prompt_tokens']}/"
+                                f"{prompt.get('token_count')}, completion="
+                                f"{result['completion_tokens']}/{args.max_tokens}"
+                            ),
+                        }
+                    )
                 async with results_lock:
                     results.append(result)
                 queue.task_done()
@@ -175,6 +197,15 @@ async def run(args: argparse.Namespace) -> int:
 
     run_end = time.perf_counter()
     results.sort(key=lambda item: item["sequence"])
+    result_prompt_ids = [result["prompt_id"] for result in results]
+    expected_prompt_ids = [prompt["prompt_id"] for prompt in prompts]
+    if len(results) != len(prompts) or sorted(result_prompt_ids) != sorted(
+        expected_prompt_ids
+    ):
+        raise RuntimeError("请求结果不满足每条 prompt 恰好一次")
+    if len(set(result_prompt_ids)) != len(result_prompt_ids):
+        raise RuntimeError("请求结果中存在重复 prompt_id")
+
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
