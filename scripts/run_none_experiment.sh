@@ -8,26 +8,139 @@
 # ---------- 固定配置 ----------
 
 configure_experiment() {
-  # TODO：集中定义模型、端口、primary、prompt、输出长度、并发点和结果目录。
-  return 0
+  VLLM_REPO="${VLLM_REPO:-/home/adminz/uring-slab-experiments/repos/vllm-0.24.0}"
+  VLLM_PYTHON="${VLLM_PYTHON:-/home/adminz/uring-slab-experiments/venvs/vllm024-cu129-clean/bin/python}"
+  MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-/home/adminz/.cache/huggingface/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6}"
+  PORT="${PORT:-8000}"
+  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-benchmark-model}"
+  CPU_AFFINITY="${CPU_AFFINITY:-0-15}"
+  PRIMARY_BYTES="${PRIMARY_BYTES:-67108864}"
+  BLOCK_SIZE="${BLOCK_SIZE:-16}"
+  MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
+  GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+  MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+  MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+  SERVER_READY_TIMEOUT_SECONDS="${SERVER_READY_TIMEOUT_SECONDS:-180}"
+
+  RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+  RESULTS_ROOT="${RESULTS_ROOT:-$PWD/results/none/$RUN_ID}"
+  mkdir -p "$RESULTS_ROOT"
+
+  [[ -d "$VLLM_REPO/vllm" ]] || {
+    echo "找不到 vLLM 源码目录：$VLLM_REPO" >&2
+    return 1
+  }
+  [[ -x "$VLLM_PYTHON" ]] || {
+    echo "找不到 vLLM Python：$VLLM_PYTHON" >&2
+    return 1
+  }
+  [[ -f "$MODEL_SNAPSHOT/config.json" ]] || {
+    echo "本地模型 snapshot 不完整或路径错误：$MODEL_SNAPSHOT" >&2
+    return 1
+  }
+  [[ -f "$MODEL_SNAPSHOT/pytorch_model.bin" ]] || {
+    echo "本地模型权重不存在：$MODEL_SNAPSHOT/pytorch_model.bin" >&2
+    return 1
+  }
 }
 
 
 # ---------- Server 生命周期 ----------
 
 start_none_server() {
-  # TODO：以 64 MiB CPU primary、无 secondary tier 的配置启动 vLLM。
-  return 0
+  local concurrency="$1"
+  local point_dir="$RESULTS_ROOT/concurrency-$concurrency"
+  local monitor_path="$point_dir/tiering-monitor"
+  local server_log="$point_dir/server.log"
+  local kv_transfer_config
+
+  mkdir -p "$point_dir"
+  kv_transfer_config=$(printf \
+    '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":%s,"block_size":%s,"eviction_policy":"lru","offload_prompt_only":true,"secondary_tiers":[]}}' \
+    "$PRIMARY_BYTES" "$BLOCK_SIZE")
+
+  echo "启动 none server：concurrency=$concurrency，日志=$server_log"
+  (
+    cd "$VLLM_REPO"
+    exec env \
+      PYTHONHASHSEED=0 \
+      PYTHONPATH="$VLLM_REPO" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      VLLM_SERVER_DEV_MODE=1 \
+      VLLM_TIERING_MONITOR_MODE=async_jsonl \
+      VLLM_TIERING_MONITOR_PATH="$monitor_path" \
+      taskset -c "$CPU_AFFINITY" \
+      "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve \
+        "$MODEL_SNAPSHOT" \
+        --port "$PORT" \
+        --served-model-name "$SERVED_MODEL_NAME" \
+        --max-model-len "$MAX_MODEL_LEN" \
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+        --dtype float16 \
+        --block-size "$BLOCK_SIZE" \
+        --enable-prefix-caching \
+        --max-num-seqs "$MAX_NUM_SEQS" \
+        --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+        --tensor-parallel-size 1 \
+        --pipeline-parallel-size 1 \
+        --kv-transfer-config "$kv_transfer_config"
+  ) >"$server_log" 2>&1 &
+
+  SERVER_PID=$!
+  SERVER_POINT_DIR="$point_dir"
+  SERVER_LOG="$server_log"
+  printf '%s\n' "$SERVER_PID" >"$point_dir/server.pid"
 }
 
 wait_until_server_ready() {
-  # TODO：等待健康检查通过，并保存 server 启动日志和最终解析配置。
-  return 0
+  local concurrency="$1"
+  local deadline=$((SECONDS + SERVER_READY_TIMEOUT_SECONDS))
+
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "none server 在就绪前退出：concurrency=$concurrency" >&2
+      tail -n 100 "$SERVER_LOG" >&2 || true
+      return 1
+    fi
+    if curl --fail --silent --show-error \
+      "http://127.0.0.1:$PORT/health" >/dev/null; then
+      if ! curl --fail --silent --show-error \
+        "http://127.0.0.1:$PORT/openapi.json" | grep -q tiering_monitor; then
+        echo "server 已启动，但 tiering monitor 接口未注册；请检查 VLLM_SERVER_DEV_MODE" >&2
+        return 1
+      fi
+      echo "none server 已就绪：concurrency=$concurrency，pid=$SERVER_PID"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "等待 none server 超时：${SERVER_READY_TIMEOUT_SECONDS}s" >&2
+  tail -n 100 "$SERVER_LOG" >&2 || true
+  return 1
 }
 
 stop_none_server() {
-  # TODO：正常停止本次 server，并确认监控后台数据已经写完。
-  return 0
+  local concurrency="$1"
+  local attempt
+
+  [[ -n "${SERVER_PID:-}" ]] || return 0
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID"
+    for attempt in {1..30}; do
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 1
+    done
+  fi
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "none server 未在 30s 内正常退出：pid=$SERVER_PID" >&2
+    return 1
+  fi
+
+  wait "$SERVER_PID" 2>/dev/null || true
+  echo "none server 已停止：concurrency=$concurrency"
+  SERVER_PID=""
 }
 
 
@@ -53,12 +166,12 @@ reset_before_measurement() {
 # ---------- 独立监控窗口 ----------
 
 begin_measurement_window() {
-  # TODO：记录当前时间和 Prometheus 累计值，只让本点请求进入 JSONL 正式窗口。
+  # TODO：通知 server 开始正式 JSONL 窗口，并记录 Prometheus 起点快照。
   return 0
 }
 
 sample_server_metrics() {
-  # TODO：窗口内采样 waiting/running、GPU KV 使用率和 CPU primary 使用指标。
+  # TODO：正式请求运行时读取 server 已维护的 waiting/running、GPU KV 和 CPU 指标。
   return 0
 }
 
@@ -97,8 +210,29 @@ check_none_qualification() {
 
 
 main() {
-  # TODO：确认骨架后，再按以上阶段串联完整实验流程。
-  return 0
+  configure_experiment
+  prepare_prompts
+
+  local concurrency
+  for concurrency in 1 2 4 8; do
+    # 每个并发点使用全新的 vLLM 进程，避免继承前一点的运行时和缓存状态。
+    start_none_server "$concurrency"
+    wait_until_server_ready "$concurrency"
+
+    # 在当前新进程内先用正式内容预热，再清掉 GPU prefix cache 和 CPU primary。
+    run_warmup "$concurrency"
+    reset_before_measurement "$concurrency"
+
+    # server 内部监控始终存在；这里只划定正式窗口并读取它已经维护的数据。
+    begin_measurement_window "$concurrency"
+    run_one_concurrency "$concurrency"
+    end_measurement_window "$concurrency"
+
+    stop_none_server "$concurrency"
+  done
+
+  finalize_results
+  check_none_qualification
 }
 
 # 当前文件仅为待审核骨架，暂不调用 main，避免误启动实验。
