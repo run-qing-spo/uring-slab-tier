@@ -28,11 +28,14 @@ configure_experiment() {
   SERVER_READY_TIMEOUT_SECONDS="${SERVER_READY_TIMEOUT_SECONDS:-180}"
   PROMPT_COUNT="${PROMPT_COUNT:-128}"
   PROMPT_TOKENS="${PROMPT_TOKENS:-128}"
+  OUTPUT_TOKENS="${OUTPUT_TOKENS:-1}"
+  CLIENT_TIMEOUT_SECONDS="${CLIENT_TIMEOUT_SECONDS:-120}"
 
   RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
   RESULTS_ROOT="${RESULTS_ROOT:-$PWD/results/none/$RUN_ID}"
   PROMPTS_PATH="${PROMPTS_PATH:-$RESULTS_ROOT/prompts.jsonl}"
   PROMPT_GENERATOR="${PROMPT_GENERATOR:-$script_dir/generate_none_prompts.py}"
+  CLOSED_LOOP_CLIENT="${CLOSED_LOOP_CLIENT:-$script_dir/run_closed_loop_client.py}"
   mkdir -p "$RESULTS_ROOT"
 
   [[ -d "$VLLM_REPO/vllm" ]] || {
@@ -60,6 +63,10 @@ configure_experiment() {
   done
   [[ -f "$PROMPT_GENERATOR" ]] || {
     echo "找不到 prompt 生成器：$PROMPT_GENERATOR" >&2
+    return 1
+  }
+  [[ -f "$CLOSED_LOOP_CLIENT" ]] || {
+    echo "找不到闭环客户端：$CLOSED_LOOP_CLIENT" >&2
     return 1
   }
 }
@@ -219,9 +226,22 @@ end_measurement_window() {
 # ---------- 正式闭环测试 ----------
 
 run_one_concurrency() {
-  # TODO：无 QPS 限速地运行固定数量的闭环 workers；记录每请求 TTFT，
-  # 并保证本点 prompt 不重复、每个并发点使用独立监控窗口。
-  return 0
+  local concurrency="$1"
+  local output="$SERVER_POINT_DIR/client-measurement.jsonl"
+  local summary="$SERVER_POINT_DIR/client-measurement-summary.json"
+
+  env PYTHONHASHSEED=0 \
+    "$VLLM_PYTHON" "$CLOSED_LOOP_CLIENT" \
+      --base-url "http://127.0.0.1:$PORT" \
+      --model "$SERVED_MODEL_NAME" \
+      --prompts "$PROMPTS_PATH" \
+      --output "$output" \
+      --concurrency "$concurrency" \
+      --max-tokens "$OUTPUT_TOKENS" \
+      --timeout-seconds "$CLIENT_TIMEOUT_SECONDS" \
+      --phase measurement >"$summary"
+
+  echo "闭环请求完成：concurrency=$concurrency，结果=$output"
 }
 
 run_concurrency_sweep() {
@@ -244,12 +264,21 @@ check_none_qualification() {
 }
 
 
+cleanup_server_on_exit() {
+  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    stop_none_server "${CURRENT_CONCURRENCY:-unknown}" || true
+  fi
+}
+
+
 main() {
+  trap cleanup_server_on_exit EXIT
   configure_experiment
   prepare_prompts
 
   local concurrency
   for concurrency in 1 2 4 8; do
+    CURRENT_CONCURRENCY="$concurrency"
     # 每个并发点使用全新的 vLLM 进程，避免继承前一点的运行时和缓存状态。
     start_none_server "$concurrency"
     wait_until_server_ready "$concurrency"
