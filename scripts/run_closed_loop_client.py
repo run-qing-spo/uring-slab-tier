@@ -132,7 +132,7 @@ async def run(args: argparse.Namespace) -> int:
     run_start = time.perf_counter()
     timeout = httpx.Timeout(args.timeout_seconds)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         worker_count = min(args.concurrency, len(prompts))
 
         async def worker(worker_id: int) -> None:
