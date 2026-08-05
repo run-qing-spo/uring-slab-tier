@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -20,6 +22,7 @@ def main() -> None:
     parser.add_argument("--n-write-threads", type=int, default=16)
     parser.add_argument("--max-inflight-jobs", type=int, default=32)
     parser.add_argument("--poll-interval-us", type=float, default=100.0)
+    parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
@@ -55,9 +58,17 @@ def main() -> None:
             ],
         ),
     ]
+    suite_id = uuid.uuid4().hex[:12]
     for name, workload_args in workloads:
         output = output_dir / f"m0-{name}.json"
-        subprocess.run(common + workload_args + ["--output", str(output)], check=True)
+        run_id = f"{suite_id}-{name}"
+        subprocess.run(
+            common + workload_args
+            + ["--run-id", run_id, "--output", str(output)],
+            check=True,
+        )
+        if not args.keep_data:
+            shutil.rmtree(args.root_dir.resolve() / f"m0-{run_id}")
 
 
 if __name__ == "__main__":
