@@ -10,8 +10,8 @@ ARM_ID="${3:?缺少arm_id}"
 RESULTS_ROOT="${4:-/home/adminz/uring-slab-experiments/results/write-qps-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 case "$BACKEND" in
-  fs|uring_slab) ;;
-  *) echo "backend必须是fs或uring_slab" >&2; exit 2 ;;
+  fs|uring_slab|uring_slab_delayed_miss) ;;
+  *) echo "backend必须是fs、uring_slab或uring_slab_delayed_miss" >&2; exit 2 ;;
 esac
 
 REPO="${REPO:-/home/adminz/uring-slab-experiments/repos/uring-slab-tier}"
@@ -73,8 +73,10 @@ if [[ "$BACKEND" == "fs" ]]; then
   EXTRA_CONFIG=$(printf '%s' \
     '{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":'"$PRIMARY_BYTES"',"block_size":'"$BLOCK_SIZE"',"eviction_policy":"lru","offload_prompt_only":true,"secondary_tiers":[{"type":"fs","root_dir":"'"$FS_ROOT"'","n_read_threads":16,"n_write_threads":16}]}')
 else
+  DELAY_MISS=false
+  [[ "$BACKEND" != "uring_slab_delayed_miss" ]] || DELAY_MISS=true
   EXTRA_CONFIG=$(printf '%s' \
-    '{"spec_name":"UringSlabOffloadingSpec","spec_module_path":"uring_slab_tier.vllm_spec","cpu_bytes_to_use":'"$PRIMARY_BYTES"',"block_size":'"$BLOCK_SIZE"',"eviction_policy":"lru","offload_prompt_only":true,"secondary_tiers":[{"type":"uring_slab","disk_bytes_to_use":'"$DISK_BYTES"',"slab_path":"'"$SLAB_PATH"'","total_qd":128,"pending_capacity":4096}]}')
+    '{"spec_name":"UringSlabOffloadingSpec","spec_module_path":"uring_slab_tier.vllm_spec","cpu_bytes_to_use":'"$PRIMARY_BYTES"',"block_size":'"$BLOCK_SIZE"',"eviction_policy":"lru","offload_prompt_only":true,"secondary_tiers":[{"type":"uring_slab","disk_bytes_to_use":'"$DISK_BYTES"',"slab_path":"'"$SLAB_PATH"'","total_qd":128,"pending_capacity":4096,"delay_miss_one_step":'"$DELAY_MISS"'}]}')
 fi
 KV_CONFIG=$(printf '%s' \
   '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":'"$EXTRA_CONFIG"'}')
@@ -142,5 +144,5 @@ printf 'backend=%s\nqps=%s\narm_id=%s\nworkload=steady_pure_write\n' \
 kill "$SERVER_PID"
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
-[[ "$BACKEND" != "uring_slab" ]] || rm -f -- "$SLAB_PATH"
+[[ "$BACKEND" == "fs" ]] || rm -f -- "$SLAB_PATH"
 echo "$ARM_DIR"

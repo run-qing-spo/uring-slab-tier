@@ -27,25 +27,27 @@ def _mean(records: list[dict[str, Any]], field: str) -> float:
 
 
 def _paired_summary(
-    pairs: list[dict[str, Any]], field: str
+    pairs: list[dict[str, Any]], field: str, baseline: str, treatment: str
 ) -> dict[str, float | int]:
     deltas = [
-        float(pair["fs"][field]) - float(pair["uring_slab"][field])
+        float(pair[baseline][field]) - float(pair[treatment][field])
         for pair in pairs
     ]
     return {
         "pairs": len(deltas),
-        "fs_minus_uring_mean_seconds": statistics.mean(deltas),
-        "fs_minus_uring_median_seconds": statistics.median(deltas),
-        "fs_slower_pairs": sum(delta > 0.0 for delta in deltas),
+        "baseline_minus_treatment_mean_seconds": statistics.mean(deltas),
+        "baseline_minus_treatment_median_seconds": statistics.median(deltas),
+        "baseline_slower_pairs": sum(delta > 0.0 for delta in deltas),
     }
 
 
-def _geometric_ratio(pairs: list[dict[str, Any]]) -> float:
+def _geometric_ratio(
+    pairs: list[dict[str, Any]], baseline: str, treatment: str
+) -> float:
     logs = [
         math.log(
-            float(pair["uring_slab"]["server_ttft_seconds"])
-            / float(pair["fs"]["server_ttft_seconds"])
+            float(pair[treatment]["server_ttft_seconds"])
+            / float(pair[baseline]["server_ttft_seconds"])
         )
         for pair in pairs
     ]
@@ -80,15 +82,22 @@ def main() -> None:
     parser.add_argument("--qps", type=int, default=100)
     parser.add_argument("--measurement-requests", type=int, default=128)
     parser.add_argument("--mad-z-threshold", type=float, default=3.5)
+    parser.add_argument("--baseline", default="fs")
+    parser.add_argument("--treatment", default="uring_slab")
     args = parser.parse_args()
+    expected_backends = {args.baseline, args.treatment}
+    if len(expected_backends) != 2:
+        raise ValueError("baseline和treatment必须不同")
 
     arm_pattern = os.path.join(args.root, f"qps-{args.qps}", "*")
     arms: list[dict[str, Any]] = []
     accounting_errors: list[float] = []
     for arm_dir in sorted(glob.glob(arm_pattern)):
         arm_name = os.path.basename(arm_dir)
-        match = re.fullmatch(r"s(\d+)-p(\d+)-(fs|uring_slab)", arm_name)
+        match = re.fullmatch(r"s(\d+)-p(\d+)-(.+)", arm_name)
         if match is None:
+            continue
+        if match.group(3) not in expected_backends:
             continue
         records = _load_ttft_records(arm_dir, args.measurement_requests)
         required = {"seconds", "accounting_error_seconds", *STAGES, *DIAGNOSTICS}
@@ -122,24 +131,28 @@ def main() -> None:
         pair_arms = [arm for arm in arms if arm["pair"] == pair_number]
         if len(pair_arms) != 2:
             raise ValueError(f"pair {pair_number}不完整")
-        fs = next(arm for arm in pair_arms if arm["backend"] == "fs")
-        uring = next(arm for arm in pair_arms if arm["backend"] == "uring_slab")
+        baseline = next(
+            arm for arm in pair_arms if arm["backend"] == args.baseline
+        )
+        treatment = next(
+            arm for arm in pair_arms if arm["backend"] == args.treatment
+        )
         pairs.append(
             {
                 "pair": pair_number,
                 "order": (
-                    "FS-uring"
-                    if int(fs["sequence"]) < int(uring["sequence"])
-                    else "uring-FS"
+                    f"{args.baseline}-{args.treatment}"
+                    if int(baseline["sequence"]) < int(treatment["sequence"])
+                    else f"{args.treatment}-{args.baseline}"
                 ),
-                "fs": fs,
-                "uring_slab": uring,
+                args.baseline: baseline,
+                args.treatment: treatment,
             }
         )
 
     outliers: list[dict[str, Any]] = []
     robust_bases: dict[str, dict[str, float]] = {}
-    for backend in ("fs", "uring_slab"):
+    for backend in (args.baseline, args.treatment):
         backend_arms = [arm for arm in arms if arm["backend"] == backend]
         values = [float(arm["server_ttft_seconds"]) for arm in backend_arms]
         median = statistics.median(values)
@@ -174,6 +187,8 @@ def main() -> None:
             "qps": args.qps,
             "measurement_requests": args.measurement_requests,
             "mad_z_threshold": args.mad_z_threshold,
+            "baseline": args.baseline,
+            "treatment": args.treatment,
         },
         "validation": {
             "arms": len(arms),
@@ -183,14 +198,26 @@ def main() -> None:
         "robust_bases": robust_bases,
         "outlier_arms": outliers,
         "raw": {
-            "server_ttft_uring_over_fs": _geometric_ratio(pairs),
-            "fields": {field: _paired_summary(pairs, field) for field in fields},
+            "server_ttft_treatment_over_baseline": _geometric_ratio(
+                pairs, args.baseline, args.treatment
+            ),
+            "fields": {
+                field: _paired_summary(
+                    pairs, field, args.baseline, args.treatment
+                )
+                for field in fields
+            },
         },
         "filtered": {
             "pairs": len(filtered_pairs),
-            "server_ttft_uring_over_fs": _geometric_ratio(filtered_pairs),
+            "server_ttft_treatment_over_baseline": _geometric_ratio(
+                filtered_pairs, args.baseline, args.treatment
+            ),
             "fields": {
-                field: _paired_summary(filtered_pairs, field) for field in fields
+                field: _paired_summary(
+                    filtered_pairs, field, args.baseline, args.treatment
+                )
+                for field in fields
             },
         },
         "pairs": pairs,

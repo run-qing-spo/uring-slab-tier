@@ -90,6 +90,7 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
         slab_path: str,
         total_qd: int = 128,
         pending_capacity: int = 4096,
+        delay_miss_one_step: bool = False,
     ) -> None:
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -111,6 +112,9 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
         # slot_capacity < 1（预算小于一个 slot）时控制面构造抛错，启动失败
         slot_capacity = disk_bytes_to_use // self._slot_bytes
         self._cp = UringSlabControlPlane(slot_capacity=slot_capacity)
+        self._delay_miss_one_step = delay_miss_one_step
+        self._misses_seen_this_step: set[tuple[str, bytes]] = set()
+        self._misses_ready: set[tuple[str, bytes]] = set()
         # slab 恰好铺 slot_capacity 个 slot：是 slot_bytes 的整数倍，满足引擎
         # 「slab_bytes % block_size == 0」约束，且与控制面 slot 数一致
         slab_bytes = slot_capacity * self._slot_bytes
@@ -137,7 +141,15 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """纯同步三态：True=resident；None=store 在途；False=miss。"""
-        return self._cp.lookup(_encode_key(key))
+        encoded_key = _encode_key(key)
+        result = self._cp.lookup(encoded_key)
+        if not self._delay_miss_one_step or result is not False:
+            return result
+        miss_key = (req_context.req_id, encoded_key)
+        if miss_key in self._misses_ready:
+            return False
+        self._misses_seen_this_step.add(miss_key)
+        return None
 
     # touch：继承基类 no-op —— v1 无 eviction/LRU，无热度可更新。
 
@@ -199,8 +211,22 @@ class UringSlabSecondaryTierManager(SecondaryTierManager):
         """固定 BLOCK_LEVEL（RequestOffloadingContext 的默认 policy）。"""
         return RequestOffloadingContext()
 
-    # on_request_finished：继承基类 no-op —— 无 per-request 状态。
-    # on_schedule_end：继承基类 no-op —— lookup 同步、无延迟提交。
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        if not self._delay_miss_one_step:
+            return
+        req_id = req_context.req_id
+        self._misses_seen_this_step = {
+            item for item in self._misses_seen_this_step if item[0] != req_id
+        }
+        self._misses_ready = {
+            item for item in self._misses_ready if item[0] != req_id
+        }
+
+    def on_schedule_end(self) -> None:
+        """实验开关：使本轮首次观测到的 miss 在下一轮可见。"""
+        if self._delay_miss_one_step:
+            self._misses_ready.update(self._misses_seen_this_step)
+            self._misses_seen_this_step.clear()
 
     def has_pending_work(self) -> bool:
         return (
