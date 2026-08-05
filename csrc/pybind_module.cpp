@@ -1,4 +1,5 @@
 #include "data_engine.h"
+#include "blocking_data_engine.h"
 
 #include <pybind11/pybind11.h>
 
@@ -25,6 +26,27 @@ py::list ToPython(std::vector<BlockCompletion> completions) {
         completion.success,
         completion.error_code);
   }
+  return result;
+}
+
+py::dict StatsToPython(const EngineStats& stats) {
+  py::dict result;
+  const auto add_direction = [&result](const char* prefix,
+                                       const DirectionIoStats& direction) {
+    const std::string name(prefix);
+    result[py::str(name + "_count")] = direction.count;
+    result[py::str(name + "_queue_ns_sum")] = direction.queue_ns_sum;
+    result[py::str(name + "_queue_ns_max")] = direction.queue_ns_max;
+    result[py::str(name + "_dispatch_to_cqe_ns_sum")] =
+        direction.dispatch_to_cqe_ns_sum;
+    result[py::str(name + "_dispatch_to_cqe_ns_max")] =
+        direction.dispatch_to_cqe_ns_max;
+  };
+  add_direction("load", stats.load);
+  add_direction("store", stats.store);
+  result[py::str("submit_calls")] = stats.submit_calls;
+  result[py::str("submitted_blocks")] = stats.submitted_blocks;
+  result[py::str("submit_batch_size_max")] = stats.submit_batch_size_max;
   return result;
 }
 
@@ -101,14 +123,7 @@ class PyDataEngine {
 
   bool HasPendingWork() const { return engine_->HasPendingWork(); }
   py::dict StatsSnapshot() const {
-    const EngineStats stats = engine_->StatsSnapshot();
-    py::dict result;
-    AddDirectionStats(result, "load", stats.load);
-    AddDirectionStats(result, "store", stats.store);
-    result[py::str("submit_calls")] = stats.submit_calls;
-    result[py::str("submitted_blocks")] = stats.submitted_blocks;
-    result[py::str("submit_batch_size_max")] = stats.submit_batch_size_max;
-    return result;
+    return StatsToPython(engine_->StatsSnapshot());
   }
   void ResetStats() { engine_->ResetStats(); }
   std::size_t BlockSizeBytes() const {
@@ -116,19 +131,6 @@ class PyDataEngine {
   }
 
  private:
-  static void AddDirectionStats(py::dict& result,
-                                const char* prefix,
-                                const DirectionIoStats& stats) {
-    const std::string name(prefix);
-    result[py::str(name + "_count")] = stats.count;
-    result[py::str(name + "_queue_ns_sum")] = stats.queue_ns_sum;
-    result[py::str(name + "_queue_ns_max")] = stats.queue_ns_max;
-    result[py::str(name + "_dispatch_to_cqe_ns_sum")] =
-        stats.dispatch_to_cqe_ns_sum;
-    result[py::str(name + "_dispatch_to_cqe_ns_max")] =
-        stats.dispatch_to_cqe_ns_max;
-  }
-
   void Submit(JobId job_id,
               py::bytes key,
               std::uint64_t primary_slot,
@@ -149,11 +151,98 @@ class PyDataEngine {
   std::unique_ptr<DataEngine> engine_;
 };
 
+class PyBlockingDataEngine {
+ public:
+  PyBlockingDataEngine(py::buffer primary_kv_view,
+                       std::string slab_path,
+                       std::size_t slab_bytes,
+                       std::size_t workers,
+                       std::size_t pending_capacity)
+      : primary_owner_(std::move(primary_kv_view)) {
+    py::buffer_info info = primary_owner_.request();
+    if (info.readonly || info.strides.empty() || info.strides[0] <= 0) {
+      throw std::invalid_argument(
+          "primary_kv_view必须可写且第一维stride为正数");
+    }
+    const auto primary_bytes =
+        static_cast<std::size_t>(info.size) *
+        static_cast<std::size_t>(info.itemsize);
+    engine_ = std::make_unique<BlockingDataEngine>(
+        info.ptr,
+        primary_bytes,
+        static_cast<std::size_t>(info.strides[0]),
+        std::move(slab_path),
+        slab_bytes,
+        workers,
+        pending_capacity);
+  }
+
+  void SubmitStore(JobId job_id,
+                   py::bytes key,
+                   std::uint64_t primary_slot,
+                   SlotId secondary_slot) {
+    Submit(job_id, std::move(key), primary_slot, secondary_slot,
+           IoDirection::kStore);
+  }
+
+  void SubmitLoad(JobId job_id,
+                  py::bytes key,
+                  std::uint64_t primary_slot,
+                  SlotId secondary_slot) {
+    Submit(job_id, std::move(key), primary_slot, secondary_slot,
+           IoDirection::kLoad);
+  }
+
+  py::list PollCompletions() {
+    return ToPython(engine_->PollCompletions());
+  }
+
+  py::list Drain() {
+    std::vector<BlockCompletion> completions;
+    {
+      py::gil_scoped_release release;
+      completions = engine_->Drain();
+    }
+    return ToPython(std::move(completions));
+  }
+
+  void Shutdown() {
+    py::gil_scoped_release release;
+    engine_->Shutdown();
+  }
+
+  bool HasPendingWork() const { return engine_->HasPendingWork(); }
+  py::dict StatsSnapshot() const {
+    return StatsToPython(engine_->StatsSnapshot());
+  }
+  void ResetStats() { engine_->ResetStats(); }
+  std::size_t BlockSizeBytes() const { return engine_->block_size_bytes(); }
+
+ private:
+  void Submit(JobId job_id,
+              py::bytes key,
+              std::uint64_t primary_slot,
+              SlotId secondary_slot,
+              IoDirection direction) {
+    engine_->Submit(BlockIo{
+        job_id,
+        key.cast<std::string>(),
+        primary_slot,
+        secondary_slot,
+        direction,
+    });
+  }
+
+  py::buffer primary_owner_;
+  std::unique_ptr<BlockingDataEngine> engine_;
+};
+
 }  // namespace
 }  // namespace uring_slab
 
 PYBIND11_MODULE(_uring_slab_engine, m) {
   using uring_slab::PyDataEngine;
+  using uring_slab::PyBlockingDataEngine;
 
   m.doc() = "基于 C++ io_uring 的 slab 数据引擎";
 
@@ -190,6 +279,30 @@ PYBIND11_MODULE(_uring_slab_engine, m) {
       .def("reset_stats", &PyDataEngine::ResetStats)
       .def_property_readonly(
           "block_size_bytes", [](const PyDataEngine& self) {
+            return self.BlockSizeBytes();
+          });
+
+  py::class_<PyBlockingDataEngine>(m, "BlockingDataEngine")
+      .def(py::init<py::buffer,
+                    std::string,
+                    std::size_t,
+                    std::size_t,
+                    std::size_t>(),
+           py::arg("primary_kv_view"),
+           py::arg("slab_path"),
+           py::arg("slab_bytes"),
+           py::arg("workers") = 32,
+           py::arg("pending_capacity") = 4096)
+      .def("submit_store", &PyBlockingDataEngine::SubmitStore)
+      .def("submit_load", &PyBlockingDataEngine::SubmitLoad)
+      .def("poll_completions", &PyBlockingDataEngine::PollCompletions)
+      .def("drain", &PyBlockingDataEngine::Drain)
+      .def("shutdown", &PyBlockingDataEngine::Shutdown)
+      .def("has_pending_work", &PyBlockingDataEngine::HasPendingWork)
+      .def("stats_snapshot", &PyBlockingDataEngine::StatsSnapshot)
+      .def("reset_stats", &PyBlockingDataEngine::ResetStats)
+      .def_property_readonly(
+          "block_size_bytes", [](const PyBlockingDataEngine& self) {
             return self.BlockSizeBytes();
           });
 }

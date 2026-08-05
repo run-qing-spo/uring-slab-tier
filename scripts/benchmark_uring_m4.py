@@ -56,6 +56,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--direction", choices=("load", "store", "mixed"), required=True
     )
+    parser.add_argument("--engine", choices=("uring", "blocking"), default="uring")
     parser.add_argument("--root-dir", type=Path, required=True)
     parser.add_argument("--block-size-bytes", type=int, required=True)
     parser.add_argument("--jobs", type=int, default=128)
@@ -65,6 +66,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--write-qps", type=float, default=50.0)
     parser.add_argument("--write-start-offset-ms", type=float, default=10.0)
     parser.add_argument("--total-qd", type=int, default=128)
+    parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--pending-capacity", type=int, default=4096)
     parser.add_argument(
         "--submit-batch-size", type=int, default=0,
@@ -88,6 +90,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     }.items():
         if value <= 0:
             raise ValueError(f"--{name}必须大于0，得到{value}")
+    if args.workers < 4:
+        raise ValueError("--workers必须至少为4")
     if args.submit_batch_size < 0 or args.submit_batch_size > args.total_qd:
         raise ValueError("--submit-batch-size必须在0到total_qd之间")
     if args.total_qd < 4:
@@ -209,6 +213,12 @@ def _stats_delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int
     return {key: int(after[key]) - int(before.get(key, 0)) for key in after}
 
 
+def _arm_name(engine: str, submit_batch_size: int) -> str:
+    if engine == "blocking":
+        return "m2"
+    return "m3" if submit_batch_size == 1 else "m4"
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         from uring_slab_tier import _uring_slab_engine
@@ -228,7 +238,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "B", shape=[total_primary_slots, args.block_size_bytes]
     )
 
-    arm = "m3" if args.submit_batch_size == 1 else "m4"
+    arm = _arm_name(args.engine, args.submit_batch_size)
     run_id = args.run_id or f"{args.direction}-{uuid.uuid4().hex[:12]}"
     run_root = args.root_dir.resolve() / f"{arm}-{run_id}"
     if run_root.exists():
@@ -240,14 +250,23 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     slab_path = run_root / "slab.bin"
     secondary_slots = len(directions) * args.jobs * args.blocks_per_job
     slab_bytes = secondary_slots * args.block_size_bytes
-    engine = _uring_slab_engine.DataEngine(
-        primary_view,
-        str(slab_path),
-        slab_bytes,
-        total_qd=args.total_qd,
-        pending_capacity=args.pending_capacity,
-        submit_batch_size=args.submit_batch_size,
-    )
+    if args.engine == "blocking":
+        engine = _uring_slab_engine.BlockingDataEngine(
+            primary_view,
+            str(slab_path),
+            slab_bytes,
+            workers=args.workers,
+            pending_capacity=args.pending_capacity,
+        )
+    else:
+        engine = _uring_slab_engine.DataEngine(
+            primary_view,
+            str(slab_path),
+            slab_bytes,
+            total_qd=args.total_qd,
+            pending_capacity=args.pending_capacity,
+            submit_batch_size=args.submit_batch_size,
+        )
 
     try:
         if "load" in directions:
@@ -389,6 +408,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 args.write_start_offset_ms if args.direction == "mixed" else None
             ),
             "total_qd": args.total_qd,
+            "engine": args.engine,
+            "workers": args.workers if args.engine == "blocking" else None,
             "pending_capacity": args.pending_capacity,
             "submit_batch_size": args.submit_batch_size,
             "max_inflight_jobs": args.max_inflight_jobs,
@@ -397,7 +418,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "buffer_bytes": buffer_bytes,
             "slab_bytes": slab_bytes,
             "o_direct": True,
-            "batch_submit": args.submit_batch_size != 1,
+            "batch_submit": (
+                args.submit_batch_size != 1 if args.engine == "uring" else None
+            ),
         },
         "result": {
             "completed_jobs": total_jobs,

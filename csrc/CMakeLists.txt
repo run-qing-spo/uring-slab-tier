@@ -8,6 +8,7 @@ pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
 pybind11_add_module(
   _uring_slab_engine
+  blocking_data_engine.cpp
   data_engine.cpp
   pybind_module.cpp
 )

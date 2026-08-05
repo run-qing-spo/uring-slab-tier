@@ -48,6 +48,10 @@ owner 仍会连续提交直到填满可用 QD，只把每次 `io_uring_submit()`
 SQE，不会把有效 QD 一并降为 1。快照中的 `submit_calls`、
 `submitted_blocks` 和 `submit_batch_size_max` 用于验证消融是否生效。
 
+M2 使用独立的 `BlockingDataEngine`：文件布局、O_DIRECT、slot offset、load
+优先和 store 并发保留与 uring DataEngine 对齐，但由 C++ worker pool 执行
+blocking `pread/pwrite`。
+
 ## Linux 特性
 
 - 单个 owner 线程独占 ring 的提交和收割。

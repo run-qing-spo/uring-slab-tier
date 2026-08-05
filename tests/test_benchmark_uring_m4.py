@@ -41,6 +41,7 @@ def test_submit_batch_size_validation() -> None:
         jobs=1,
         blocks_per_job=1,
         total_qd=8,
+        workers=32,
         pending_capacity=8,
         submit_batch_size=9,
         max_inflight_jobs=1,
@@ -56,3 +57,7 @@ def test_submit_batch_size_validation() -> None:
         assert "submit-batch-size" in str(exc)
     else:
         raise AssertionError("超出QD的submit batch必须被拒绝")
+
+
+def test_blocking_engine_selects_m2_arm() -> None:
+    assert _MODULE._arm_name("blocking", 0) == "m2"
