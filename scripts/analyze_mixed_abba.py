@@ -58,6 +58,9 @@ def main() -> None:
                 if len(records) != 128 or not all(record["ok"] for record in records):
                     raise ValueError(f"{path}不是128条全部成功的请求")
                 means[kind] = statistics.mean(record["ttft_seconds"] * 1000 for record in records)
+                means[f"{kind}_tail"] = statistics.mean(
+                    record["ttft_seconds"] * 1000 for record in records[32:]
+                )
             arms.append({
                 "batch": batch,
                 "sequence": int(match.group(1)),
@@ -66,6 +69,8 @@ def main() -> None:
                 "directory": arm_dir,
                 "read_mean_ms": means["read"],
                 "write_mean_ms": means["write"],
+                "read_tail_mean_ms": means["read_tail"],
+                "write_tail_mean_ms": means["write_tail"],
                 "client": client,
                 "window": window,
             })
@@ -88,6 +93,8 @@ def main() -> None:
                 "fs_write_mean_ms": fs["write_mean_ms"],
                 "uring_write_mean_ms": uring["write_mean_ms"],
                 "write_ratio": float(uring["write_mean_ms"]) / float(fs["write_mean_ms"]),
+                "read_tail_ratio": float(uring["read_tail_mean_ms"]) / float(fs["read_tail_mean_ms"]),
+                "write_tail_ratio": float(uring["write_tail_mean_ms"]) / float(fs["write_tail_mean_ms"]),
             })
 
     invalid = []
@@ -110,10 +117,45 @@ def main() -> None:
         if issues:
             invalid.append({"directory": arm["directory"], "issues": issues})
 
+    outlier_arms = []
+    for kind in ("read", "write"):
+        for backend in ("fs", "uring_slab"):
+            selected = [arm for arm in arms if arm["backend"] == backend]
+            values = [float(arm[f"{kind}_mean_ms"]) for arm in selected]
+            median = statistics.median(values)
+            mad = statistics.median(abs(value - median) for value in values)
+            for arm in selected:
+                robust_z = (
+                    0.6745 * (float(arm[f"{kind}_mean_ms"]) - median) / mad
+                    if mad else 0.0
+                )
+                if abs(robust_z) > 3.5:
+                    outlier_arms.append({
+                        "batch": arm["batch"],
+                        "pair": arm["pair"],
+                        "backend": backend,
+                        "kind": kind,
+                        "directory": arm["directory"],
+                        "mean_ttft_ms": arm[f"{kind}_mean_ms"],
+                        "robust_z": robust_z,
+                    })
+    flagged_pairs = {
+        (item["batch"], item["pair"]) for item in outlier_arms
+    }
+    filtered_pairs = [
+        pair for pair in pairs
+        if (pair["batch"], pair["pair"]) not in flagged_pairs
+    ]
+
     result = {
         "roots": args.roots,
         "read_effect": effect(pairs, "read"),
         "write_effect": effect(pairs, "write"),
+        "discard_first_32_read_effect": effect(pairs, "read_tail"),
+        "discard_first_32_write_effect": effect(pairs, "write_tail"),
+        "outlier_arms": outlier_arms,
+        "filtered_read_effect": effect(filtered_pairs, "read"),
+        "filtered_write_effect": effect(filtered_pairs, "write"),
         "arithmetic_arm_means_ms": {
             backend: {
                 kind: statistics.mean(float(arm[f"{kind}_mean_ms"]) for arm in arms if arm["backend"] == backend)
