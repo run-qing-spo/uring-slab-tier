@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("--block-size-bytes", type=int, required=True)
     parser.add_argument("--jobs", type=int, default=128)
     parser.add_argument("--blocks-per-job", type=int, default=8)
-    parser.add_argument("--total-qd", type=int, default=128)
+    parser.add_argument("--total-qd", type=int, default=32)
     parser.add_argument("--pending-capacity", type=int, default=4096)
     parser.add_argument("--max-inflight-jobs", type=int, default=32)
     parser.add_argument("--poll-interval-us", type=float, default=100.0)
