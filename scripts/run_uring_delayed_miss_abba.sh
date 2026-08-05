@@ -27,7 +27,7 @@ for pair in $(seq 1 "$PAIR_COUNT"); do
     arm_id=$(printf 's%02d-p%02d' "$sequence" "$pair")
     printf '%s\t%s\t%s\t%s\t%s\tstarted\n' \
       "$sequence" "$pair" "$position" "$backend" "$arm_id" >>"$ORDER_FILE"
-    "$ARM_RUNNER" "$backend" "$QPS" "$arm_id" "$RESULTS_ROOT"
+    bash "$ARM_RUNNER" "$backend" "$QPS" "$arm_id" "$RESULTS_ROOT"
     printf '%s\t%s\t%s\t%s\t%s\tcompleted\n' \
       "$sequence" "$pair" "$position" "$backend" "$arm_id" >>"$ORDER_FILE"
   done
