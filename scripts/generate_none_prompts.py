@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-snapshot", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--count", type=int, default=128)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=16)
     return parser.parse_args()
@@ -56,7 +57,12 @@ def make_prompt(tokenizer, index: int, target_tokens: int) -> str:
 
 def main() -> None:
     args = parse_args()
-    if args.count <= 0 or args.tokens <= 0 or args.block_size <= 0:
+    if (
+        args.count <= 0
+        or args.start_index < 0
+        or args.tokens <= 0
+        or args.block_size <= 0
+    ):
         raise ValueError("count、tokens 和 block-size 必须为正数")
     if args.tokens < args.block_size:
         raise ValueError("tokens 不能小于 block-size")
@@ -74,7 +80,9 @@ def main() -> None:
     seen_hashes: set[str] = set()
     try:
         with temporary.open("w", encoding="utf-8") as stream:
-            for index in range(args.count):
+            for index in range(
+                args.start_index, args.start_index + args.count
+            ):
                 prompt = make_prompt(tokenizer, index, args.tokens)
                 digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 if prompt in seen_prompts or digest in seen_hashes:

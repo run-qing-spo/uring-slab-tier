@@ -36,11 +36,11 @@ async def run(args: argparse.Namespace) -> int:
     active = 0
     active_peak = 0
     dispatch_times: list[float] = []
-    run_start = time.perf_counter()
-
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(args.timeout_seconds), trust_env=False
     ) as client:
+        # HTTP client 初始化不属于 offered-load 时间轴；首请求应在此刻到达。
+        run_start = time.perf_counter()
 
         async def scheduled_request(
             sequence: int, prompt: dict[str, Any]
