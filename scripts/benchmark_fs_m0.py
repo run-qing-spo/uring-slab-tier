@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import hashlib
 import json
@@ -45,6 +46,17 @@ def _block_path(root: Path, job_id: int, block_index: int) -> str:
     return str(root / digest[:3] / f"{digest[3:5]}_g0" / f"{digest}.bin")
 
 
+def _secondary_offset(
+    direction_base_slots: int,
+    job_index: int,
+    block_index: int,
+    blocks_per_job: int,
+    block_size: int,
+) -> int:
+    slot = direction_base_slots + job_index * blocks_per_job + block_index
+    return slot * block_size
+
+
 def _usage_delta(before: resource.struct_rusage,
                  after: resource.struct_rusage) -> dict[str, float | int]:
     return {
@@ -57,11 +69,12 @@ def _usage_delta(before: resource.struct_rusage,
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="复用 vLLM 原生 FS 数据面的 M0 load/store/mixed 微基准"
+        description="Python pool的M0 files / M1 slab微基准"
     )
     parser.add_argument(
         "--direction", choices=("load", "store", "mixed"), required=True
     )
+    parser.add_argument("--layout", choices=("files", "slab"), default="files")
     parser.add_argument("--root-dir", type=Path, required=True)
     parser.add_argument("--block-size-bytes", type=int, required=True)
     parser.add_argument(
@@ -136,7 +149,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 def _build_tasks(
     *,
     operation: Any,
-    paths: list[str],
+    paths: list[Any],
     buffer: memoryview,
     slot_group: int,
     blocks_per_job: int,
@@ -171,7 +184,7 @@ def _seed_load_files(
     *,
     pool: Any,
     store_block: Any,
-    paths_by_job: list[list[str]],
+    paths_by_job: list[list[Any]],
     buffer: memoryview,
     blocks_per_job: int,
     block_size: int,
@@ -193,6 +206,55 @@ def _seed_load_files(
     _drain_seed_completions(pool, len(paths_by_job))
 
 
+class _SlabIo:
+    def __init__(self, path: Path, size: int) -> None:
+        self._fd = os.open(
+            path,
+            os.O_CREAT | os.O_RDWR | os.O_TRUNC | os.O_CLOEXEC
+            | getattr(os, "O_DIRECT", 0),
+            0o644,
+        )
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if hasattr(os, "posix_fallocate"):
+                os.posix_fallocate(self._fd, 0, size)
+            else:
+                os.ftruncate(self._fd, size)
+        except Exception:
+            os.close(self._fd)
+            self._fd = -1
+            raise
+
+    def store_block(
+        self,
+        secondary_offset: int,
+        buffer: memoryview,
+        primary_offset: int,
+        block_size: int,
+    ) -> None:
+        view = buffer.cast("B")[primary_offset : primary_offset + block_size]
+        written = os.pwritev(self._fd, [view], secondary_offset)
+        if written != block_size:
+            raise OSError(f"Short pwritev: expected={block_size}, got={written}")
+
+    def load_block(
+        self,
+        secondary_offset: int,
+        buffer: memoryview,
+        primary_offset: int,
+        block_size: int,
+    ) -> None:
+        view = buffer.cast("B")[primary_offset : primary_offset + block_size]
+        read = os.preadv(self._fd, [view], secondary_offset)
+        if read != block_size:
+            raise OSError(f"Short preadv: expected={block_size}, got={read}")
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+
 def _sample_summary(samples: list[int]) -> dict[str, Any]:
     return {
         "mean": statistics.mean(samples),
@@ -209,8 +271,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
     from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
+    arm = "m1" if args.layout == "slab" else "m0"
     run_id = args.run_id or f"{args.direction}-{uuid.uuid4().hex[:12]}"
-    run_root = args.root_dir.resolve() / f"m0-{run_id}"
+    run_root = args.root_dir.resolve() / f"{arm}-{run_id}"
     if run_root.exists():
         raise FileExistsError(f"run 目录已存在，拒绝复用：{run_root}")
     run_root.mkdir(parents=True)
@@ -227,16 +290,42 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     for offset in range(0, buffer_bytes, mmap.PAGESIZE):
         primary_view[offset] = 0xA5
 
-    paths_by_direction = {
-        direction: [
-            [
-                _block_path(run_root / direction, job_index, block)
-                for block in range(args.blocks_per_job)
+    total_secondary_slots = len(directions) * args.jobs * args.blocks_per_job
+    slab_io = (
+        _SlabIo(run_root / "slab.bin", total_secondary_slots * args.block_size_bytes)
+        if args.layout == "slab"
+        else None
+    )
+    if args.layout == "files":
+        paths_by_direction = {
+            direction: [
+                [
+                    _block_path(run_root / direction, job_index, block)
+                    for block in range(args.blocks_per_job)
+                ]
+                for job_index in range(args.jobs)
             ]
-            for job_index in range(args.jobs)
-        ]
-        for direction in directions
-    }
+            for direction in directions
+        }
+    else:
+        paths_by_direction = {
+            direction: [
+                [
+                    _secondary_offset(
+                        (args.jobs * args.blocks_per_job
+                         if args.direction == "mixed" and direction == "store"
+                         else 0),
+                        job_index,
+                        block,
+                        args.blocks_per_job,
+                        args.block_size_bytes,
+                    )
+                    for block in range(args.blocks_per_job)
+                ]
+                for job_index in range(args.jobs)
+            ]
+            for direction in directions
+        }
     pool = DualQueueThreadPool(
         args.n_read_threads,
         args.n_write_threads,
@@ -244,17 +333,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     try:
+        store_operation = store_block if slab_io is None else slab_io.store_block
+        load_operation = load_block if slab_io is None else slab_io.load_block
         if "load" in directions:
             _seed_load_files(
                 pool=pool,
-                store_block=store_block,
+                store_block=store_operation,
                 paths_by_job=paths_by_direction["load"],
                 buffer=primary_view,
                 blocks_per_job=args.blocks_per_job,
                 block_size=args.block_size_bytes,
             )
 
-        operations = {"load": load_block, "store": store_block}
+        operations = {"load": load_operation, "store": store_operation}
         enqueues = {"load": pool.enqueue_load, "store": pool.enqueue_store}
 
         # 预先生成两个独立开环流的绝对时间表。相同 due time 时 load 排在 store
@@ -360,6 +451,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
     finally:
         pool.shutdown(wait=True)
+        if slab_io is not None:
+            slab_io.close()
         primary_view.release()
         primary_mmap.close()
 
@@ -401,12 +494,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "schema_version": 2,
-        "benchmark": "vllm_fs_m0",
+        "benchmark": "python_slab_m1" if arm == "m1" else "vllm_fs_m0",
         "run_id": run_id,
         "run_root": str(run_root),
         "valid_for_formal_comparison": direct_io,
         "configuration": {
             "direction": args.direction,
+            "layout": args.layout,
             "block_size_bytes": args.block_size_bytes,
             "jobs": args.jobs,
             "blocks_per_job": args.blocks_per_job,
