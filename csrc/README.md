@@ -43,6 +43,11 @@ SQ 和 CQ 不按 load/store 静态分区。SQ 容量覆盖 `total_qd`，CQ 容�
 正式实验窗口在开始和结束时各取一次快照并相减。后一段包含 SQE 准备、
 提交、内核及设备处理和 CQE 可见时间，不应单独解释成裸设备延迟。
 
+`submit_batch_size=0` 保持默认的尽可能批量提交；M3 消融使用值 1。值 1 时
+owner 仍会连续提交直到填满可用 QD，只把每次 `io_uring_submit()` 限制为一个
+SQE，不会把有效 QD 一并降为 1。快照中的 `submit_calls`、
+`submitted_blocks` 和 `submit_batch_size_max` 用于验证消融是否生效。
+
 ## Linux 特性
 
 - 单个 owner 线程独占 ring 的提交和收割。

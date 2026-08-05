@@ -43,6 +43,8 @@ struct BlockCompletion {
 struct EngineOptions {
   std::size_t total_qd;
   std::size_t pending_capacity;
+  // 0 表示单轮尽可能批量提交；1 用于 M3 单 SQE submit 消融。
+  std::size_t submit_batch_size = 0;
 };
 
 struct DirectionIoStats {
@@ -56,6 +58,9 @@ struct DirectionIoStats {
 struct EngineStats {
   DirectionIoStats load;
   DirectionIoStats store;
+  std::uint64_t submit_calls = 0;
+  std::uint64_t submitted_blocks = 0;
+  std::uint64_t submit_batch_size_max = 0;
 };
 
 // 单个 owner 线程独占 io_uring，负责提交 SQE 和收割 CQE。
@@ -90,6 +95,8 @@ class DataEngine {
 
   bool HasPendingWork() const noexcept;
   EngineStats StatsSnapshot() const noexcept;
+  // 仅在没有已接受任务和未消费 completion 时清零累计统计。
+  void ResetStats();
 
   std::size_t block_size_bytes() const noexcept { return block_size_bytes_; }
   std::size_t total_qd() const noexcept { return total_qd_; }
@@ -102,6 +109,12 @@ class DataEngine {
     bool occupied = false;
   };
 
+  struct SubmitBatchStats {
+    std::uint64_t calls = 0;
+    std::uint64_t blocks = 0;
+    std::uint64_t max_batch = 0;
+  };
+
   void InitializeSlabAndRing();
   void DestroySlabAndRing() noexcept;
   void ValidateGeometry() const;
@@ -111,7 +124,7 @@ class DataEngine {
 
   void OwnerLoop();
   void DispatchAvailable();
-  void SubmitPrepared(unsigned prepared);
+  SubmitBatchStats SubmitPrepared(unsigned prepared);
   void ReapAvailable();
   void Finish(RequestContext* context, int result);
   bool CanDispatchLocked() const;
@@ -127,6 +140,7 @@ class DataEngine {
   const std::size_t load_reserve_;
   const std::size_t store_qd_;
   const std::size_t pending_capacity_;
+  const std::size_t submit_batch_size_;
 
   int slab_fd_ = -1;
   int wake_fd_ = -1;

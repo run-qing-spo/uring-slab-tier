@@ -34,7 +34,8 @@ class PyDataEngine {
                std::string slab_path,
                std::size_t slab_bytes,
                std::size_t total_qd,
-               std::size_t pending_capacity)
+               std::size_t pending_capacity,
+               std::size_t submit_batch_size)
       : primary_owner_(std::move(primary_kv_view)) {
     py::buffer_info info = primary_owner_.request();
     if (info.readonly) {
@@ -60,6 +61,7 @@ class PyDataEngine {
         EngineOptions{
             .total_qd = total_qd,
             .pending_capacity = pending_capacity,
+            .submit_batch_size = submit_batch_size,
         });
   }
 
@@ -103,8 +105,12 @@ class PyDataEngine {
     py::dict result;
     AddDirectionStats(result, "load", stats.load);
     AddDirectionStats(result, "store", stats.store);
+    result[py::str("submit_calls")] = stats.submit_calls;
+    result[py::str("submitted_blocks")] = stats.submitted_blocks;
+    result[py::str("submit_batch_size_max")] = stats.submit_batch_size_max;
     return result;
   }
+  void ResetStats() { engine_->ResetStats(); }
   std::size_t BlockSizeBytes() const {
     return engine_->block_size_bytes();
   }
@@ -156,12 +162,14 @@ PYBIND11_MODULE(_uring_slab_engine, m) {
                     std::string,
                     std::size_t,
                     std::size_t,
+                    std::size_t,
                     std::size_t>(),
            py::arg("primary_kv_view"),
            py::arg("slab_path"),
            py::arg("slab_bytes"),
            py::arg("total_qd") = 128,
-           py::arg("pending_capacity") = 4096)
+           py::arg("pending_capacity") = 4096,
+           py::arg("submit_batch_size") = 0)
       .def("submit_store",
            &PyDataEngine::SubmitStore,
            py::arg("job_id"),
@@ -179,6 +187,7 @@ PYBIND11_MODULE(_uring_slab_engine, m) {
       .def("shutdown", &PyDataEngine::Shutdown)
       .def("has_pending_work", &PyDataEngine::HasPendingWork)
       .def("stats_snapshot", &PyDataEngine::StatsSnapshot)
+      .def("reset_stats", &PyDataEngine::ResetStats)
       .def_property_readonly(
           "block_size_bytes", [](const PyDataEngine& self) {
             return self.BlockSizeBytes();

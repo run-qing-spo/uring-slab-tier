@@ -68,7 +68,10 @@ DataEngine::DataEngine(void* primary_base,
       total_qd_(options.total_qd),
       load_reserve_(std::max<std::size_t>(1, options.total_qd / 4)),
       store_qd_(options.total_qd - load_reserve_),
-      pending_capacity_(options.pending_capacity) {
+      pending_capacity_(options.pending_capacity),
+      submit_batch_size_(options.submit_batch_size == 0
+                             ? options.total_qd
+                             : options.submit_batch_size) {
   if (primary_base_ == nullptr) {
     throw std::invalid_argument("primary_base 不能为空");
   }
@@ -95,6 +98,10 @@ DataEngine::DataEngine(void* primary_base,
   if (pending_capacity_ < total_qd_) {
     throw std::invalid_argument(
         "pending_capacity 不能小于 total_qd");
+  }
+  if (submit_batch_size_ > total_qd_) {
+    throw std::invalid_argument(
+        "submit_batch_size 不能大于 total_qd");
   }
 
   contexts_.reserve(total_qd_);
@@ -344,6 +351,15 @@ EngineStats DataEngine::StatsSnapshot() const noexcept {
   return stats_;
 }
 
+void DataEngine::ResetStats() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (accepted_not_completed_ != 0 || !completions_.empty()) {
+    throw std::runtime_error(
+        "DataEngine 有 pending work，不能清零统计");
+  }
+  stats_ = EngineStats{};
+}
+
 void DataEngine::WakeOwner() noexcept {
   if (wake_fd_ < 0) {
     return;
@@ -429,54 +445,72 @@ void DataEngine::OwnerLoop() {
 }
 
 void DataEngine::DispatchAvailable() {
-  unsigned prepared = 0;
-  while (true) {
-    RequestContext* context = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!CanDispatchLocked()) {
-        break;
+  SubmitBatchStats dispatch_stats;
+  for (;;) {
+    unsigned prepared = 0;
+    while (prepared < submit_batch_size_) {
+      RequestContext* context = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!CanDispatchLocked()) {
+          break;
+        }
+        context = AcquireContextLocked();
+        if (!load_pending_.empty()) {
+          context->task = std::move(load_pending_.front());
+          load_pending_.pop_front();
+          ++load_in_flight_;
+        } else {
+          context->task = std::move(store_pending_.front());
+          store_pending_.pop_front();
+          ++store_in_flight_;
+        }
+        context->dispatch_ns = MonotonicNowNs();
       }
-      context = AcquireContextLocked();
-      if (!load_pending_.empty()) {
-        context->task = std::move(load_pending_.front());
-        load_pending_.pop_front();
-        ++load_in_flight_;
+
+      io_uring_sqe* sqe = io_uring_get_sqe(ring_);
+      if (sqe == nullptr) {
+        std::terminate();  // 逻辑 QD 按约定必须完全容纳于 SQ。
+      }
+
+      const auto primary_offset =
+          static_cast<std::size_t>(context->task.primary_slot) *
+          block_size_bytes_;
+      const auto slab_offset = static_cast<off_t>(
+          context->task.secondary_slot * block_size_bytes_);
+      void* const primary_address = primary_base_ + primary_offset;
+
+      if (context->task.direction == IoDirection::kStore) {
+        io_uring_prep_write(sqe, 0, primary_address, block_size_bytes_,
+                            slab_offset);
       } else {
-        context->task = std::move(store_pending_.front());
-        store_pending_.pop_front();
-        ++store_in_flight_;
+        io_uring_prep_read(sqe, 0, primary_address, block_size_bytes_,
+                           slab_offset);
       }
-      context->dispatch_ns = MonotonicNowNs();
+      io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+      io_uring_sqe_set_data(sqe, context);
+      ++prepared;
     }
-
-    io_uring_sqe* sqe = io_uring_get_sqe(ring_);
-    if (sqe == nullptr) {
-      std::terminate();  // 逻辑 QD 按约定必须完全容纳于 SQ。
+    if (prepared == 0) {
+      break;
     }
-
-    const auto primary_offset =
-        static_cast<std::size_t>(context->task.primary_slot) *
-        block_size_bytes_;
-    const auto slab_offset =
-        static_cast<off_t>(context->task.secondary_slot * block_size_bytes_);
-    void* const primary_address = primary_base_ + primary_offset;
-
-    if (context->task.direction == IoDirection::kStore) {
-      io_uring_prep_write(sqe, 0, primary_address, block_size_bytes_,
-                          slab_offset);
-    } else {
-      io_uring_prep_read(sqe, 0, primary_address, block_size_bytes_,
-                         slab_offset);
-    }
-    io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-    io_uring_sqe_set_data(sqe, context);
-    ++prepared;
+    const SubmitBatchStats submitted = SubmitPrepared(prepared);
+    dispatch_stats.calls += submitted.calls;
+    dispatch_stats.blocks += submitted.blocks;
+    dispatch_stats.max_batch =
+        std::max(dispatch_stats.max_batch, submitted.max_batch);
   }
-  SubmitPrepared(prepared);
+  if (dispatch_stats.calls != 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.submit_calls += dispatch_stats.calls;
+    stats_.submitted_blocks += dispatch_stats.blocks;
+    stats_.submit_batch_size_max =
+        std::max(stats_.submit_batch_size_max, dispatch_stats.max_batch);
+  }
 }
 
-void DataEngine::SubmitPrepared(unsigned prepared) {
+DataEngine::SubmitBatchStats DataEngine::SubmitPrepared(unsigned prepared) {
+  SubmitBatchStats stats;
   unsigned submitted = 0;
   while (submitted < prepared) {
     const int result = io_uring_submit(ring_);
@@ -484,7 +518,12 @@ void DataEngine::SubmitPrepared(unsigned prepared) {
       std::terminate();
     }
     submitted += static_cast<unsigned>(result);
+    ++stats.calls;
+    stats.blocks += static_cast<unsigned>(result);
+    stats.max_batch =
+        std::max(stats.max_batch, static_cast<std::uint64_t>(result));
   }
+  return stats;
 }
 
 void DataEngine::ReapAvailable() {

@@ -66,6 +66,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--write-start-offset-ms", type=float, default=10.0)
     parser.add_argument("--total-qd", type=int, default=128)
     parser.add_argument("--pending-capacity", type=int, default=4096)
+    parser.add_argument(
+        "--submit-batch-size", type=int, default=0,
+        help="0表示M4尽可能批量；1表示M3逐SQE submit",
+    )
     parser.add_argument("--max-inflight-jobs", type=int, default=32)
     parser.add_argument("--poll-interval-us", type=float, default=100.0)
     parser.add_argument("--run-id", default=None)
@@ -84,6 +88,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     }.items():
         if value <= 0:
             raise ValueError(f"--{name}必须大于0，得到{value}")
+    if args.submit_batch_size < 0 or args.submit_batch_size > args.total_qd:
+        raise ValueError("--submit-batch-size必须在0到total_qd之间")
     if args.total_qd < 4:
         raise ValueError("--total-qd必须至少为4")
     if args.pending_capacity < args.total_qd:
@@ -222,8 +228,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "B", shape=[total_primary_slots, args.block_size_bytes]
     )
 
+    arm = "m3" if args.submit_batch_size == 1 else "m4"
     run_id = args.run_id or f"{args.direction}-{uuid.uuid4().hex[:12]}"
-    run_root = args.root_dir.resolve() / f"m4-{run_id}"
+    run_root = args.root_dir.resolve() / f"{arm}-{run_id}"
     if run_root.exists():
         primary_view.release()
         flat_view.release()
@@ -239,11 +246,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         slab_bytes,
         total_qd=args.total_qd,
         pending_capacity=args.pending_capacity,
+        submit_batch_size=args.submit_batch_size,
     )
 
     try:
         if "load" in directions:
             _seed_loads(engine, jobs=args.jobs, blocks_per_job=args.blocks_per_job)
+        engine.reset_stats()
         stats_before = dict(engine.stats_snapshot())
 
         free_groups = list(range(slot_groups - 1, -1, -1))
@@ -364,7 +373,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     total_bytes = total_blocks * args.block_size_bytes
     return {
         "schema_version": 2,
-        "benchmark": "uring_slab_m4",
+        "benchmark": f"uring_slab_{arm}",
         "run_id": run_id,
         "run_root": str(run_root),
         "valid_for_formal_comparison": True,
@@ -381,13 +390,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "total_qd": args.total_qd,
             "pending_capacity": args.pending_capacity,
+            "submit_batch_size": args.submit_batch_size,
             "max_inflight_jobs": args.max_inflight_jobs,
             "effective_slot_groups": slot_groups,
             "poll_interval_us": args.poll_interval_us,
             "buffer_bytes": buffer_bytes,
             "slab_bytes": slab_bytes,
             "o_direct": True,
-            "batch_submit": True,
+            "batch_submit": args.submit_batch_size != 1,
         },
         "result": {
             "completed_jobs": total_jobs,
