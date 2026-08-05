@@ -32,6 +32,17 @@ SQ 和 CQ 不按 load/store 静态分区。SQ 容量覆盖 `total_qd`，CQ 容�
 短读写和 I/O 错误。`poll_completions()` 非阻塞地消费当前全部可见结果；
 `drain()` 等待所有已接受任务结束，并消费此前尚未被 poll 的 completion。
 
+## 最小 I/O 计时
+
+`stats_snapshot()` 返回进程生命周期内的累计快照，load/store 分开统计：
+
+- `count`：已收割 CQE 的 block 数；
+- `queue_ns_sum/max`：任务被接受到 owner 取出任务的等待时间；
+- `dispatch_to_cqe_ns_sum/max`：owner 取出任务到收割 CQE 的时间。
+
+正式实验窗口在开始和结束时各取一次快照并相减。后一段包含 SQE 准备、
+提交、内核及设备处理和 CQE 可见时间，不应单独解释成裸设备延迟。
+
 ## Linux 特性
 
 - 单个 owner 线程独占 ring 的提交和收割。

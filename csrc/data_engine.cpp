@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +43,13 @@ unsigned RingEntries(std::size_t requested, const char* description) {
     throw std::invalid_argument(std::string(description) + " 过大");
   }
   return static_cast<unsigned>(rounded);
+}
+
+std::uint64_t MonotonicNowNs() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 
 }  // namespace
@@ -283,6 +291,7 @@ void DataEngine::Submit(BlockIo task) {
       });
       return;
     }
+    task.enqueue_ns = MonotonicNowNs();
     if (task.direction == IoDirection::kLoad) {
       load_pending_.push_back(std::move(task));
     } else {
@@ -328,6 +337,11 @@ void DataEngine::Shutdown() {
 bool DataEngine::HasPendingWork() const noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   return accepted_not_completed_ != 0 || !completions_.empty();
+}
+
+EngineStats DataEngine::StatsSnapshot() const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return stats_;
 }
 
 void DataEngine::WakeOwner() noexcept {
@@ -433,6 +447,7 @@ void DataEngine::DispatchAvailable() {
         store_pending_.pop_front();
         ++store_in_flight_;
       }
+      context->dispatch_ns = MonotonicNowNs();
     }
 
     io_uring_sqe* sqe = io_uring_get_sqe(ring_);
@@ -483,12 +498,26 @@ void DataEngine::ReapAvailable() {
 }
 
 void DataEngine::Finish(RequestContext* context, int result) {
+  const std::uint64_t cqe_ns = MonotonicNowNs();
   std::lock_guard<std::mutex> lock(mutex_);
   if (context == nullptr || !context->occupied) {
     std::terminate();
   }
   const bool success = result == static_cast<int>(block_size_bytes_);
   const int error_code = success ? 0 : (result < 0 ? -result : EIO);
+  DirectionIoStats& direction_stats =
+      context->task.direction == IoDirection::kLoad ? stats_.load
+                                                     : stats_.store;
+  const std::uint64_t queue_ns =
+      context->dispatch_ns - context->task.enqueue_ns;
+  const std::uint64_t dispatch_to_cqe_ns = cqe_ns - context->dispatch_ns;
+  ++direction_stats.count;
+  direction_stats.queue_ns_sum += queue_ns;
+  direction_stats.queue_ns_max =
+      std::max(direction_stats.queue_ns_max, queue_ns);
+  direction_stats.dispatch_to_cqe_ns_sum += dispatch_to_cqe_ns;
+  direction_stats.dispatch_to_cqe_ns_max = std::max(
+      direction_stats.dispatch_to_cqe_ns_max, dispatch_to_cqe_ns);
   completions_.push_back(BlockCompletion{
       context->task.job_id,
       std::move(context->task.key),

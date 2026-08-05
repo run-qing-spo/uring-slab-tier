@@ -98,11 +98,31 @@ class PyDataEngine {
   }
 
   bool HasPendingWork() const { return engine_->HasPendingWork(); }
+  py::dict StatsSnapshot() const {
+    const EngineStats stats = engine_->StatsSnapshot();
+    py::dict result;
+    AddDirectionStats(result, "load", stats.load);
+    AddDirectionStats(result, "store", stats.store);
+    return result;
+  }
   std::size_t BlockSizeBytes() const {
     return engine_->block_size_bytes();
   }
 
  private:
+  static void AddDirectionStats(py::dict& result,
+                                const char* prefix,
+                                const DirectionIoStats& stats) {
+    const std::string name(prefix);
+    result[py::str(name + "_count")] = stats.count;
+    result[py::str(name + "_queue_ns_sum")] = stats.queue_ns_sum;
+    result[py::str(name + "_queue_ns_max")] = stats.queue_ns_max;
+    result[py::str(name + "_dispatch_to_cqe_ns_sum")] =
+        stats.dispatch_to_cqe_ns_sum;
+    result[py::str(name + "_dispatch_to_cqe_ns_max")] =
+        stats.dispatch_to_cqe_ns_max;
+  }
+
   void Submit(JobId job_id,
               py::bytes key,
               std::uint64_t primary_slot,
@@ -158,6 +178,7 @@ PYBIND11_MODULE(_uring_slab_engine, m) {
       .def("drain", &PyDataEngine::Drain)
       .def("shutdown", &PyDataEngine::Shutdown)
       .def("has_pending_work", &PyDataEngine::HasPendingWork)
+      .def("stats_snapshot", &PyDataEngine::StatsSnapshot)
       .def_property_readonly(
           "block_size_bytes", [](const PyDataEngine& self) {
             return self.BlockSizeBytes();

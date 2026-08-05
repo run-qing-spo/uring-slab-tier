@@ -29,6 +29,8 @@ struct BlockIo {
   std::uint64_t primary_slot;
   SlotId secondary_slot;
   IoDirection direction;
+  // DataEngine::Submit 接受任务时写入，仅供引擎内部计时。
+  std::uint64_t enqueue_ns = 0;
 };
 
 struct BlockCompletion {
@@ -41,6 +43,19 @@ struct BlockCompletion {
 struct EngineOptions {
   std::size_t total_qd;
   std::size_t pending_capacity;
+};
+
+struct DirectionIoStats {
+  std::uint64_t count = 0;
+  std::uint64_t queue_ns_sum = 0;
+  std::uint64_t queue_ns_max = 0;
+  std::uint64_t dispatch_to_cqe_ns_sum = 0;
+  std::uint64_t dispatch_to_cqe_ns_max = 0;
+};
+
+struct EngineStats {
+  DirectionIoStats load;
+  DirectionIoStats store;
 };
 
 // 单个 owner 线程独占 io_uring，负责提交 SQE 和收割 CQE。
@@ -74,6 +89,7 @@ class DataEngine {
   void Shutdown();
 
   bool HasPendingWork() const noexcept;
+  EngineStats StatsSnapshot() const noexcept;
 
   std::size_t block_size_bytes() const noexcept { return block_size_bytes_; }
   std::size_t total_qd() const noexcept { return total_qd_; }
@@ -82,6 +98,7 @@ class DataEngine {
  private:
   struct RequestContext {
     BlockIo task;
+    std::uint64_t dispatch_ns = 0;
     bool occupied = false;
   };
 
@@ -128,6 +145,7 @@ class DataEngine {
   std::size_t load_in_flight_ = 0;
   std::size_t store_in_flight_ = 0;
   std::size_t accepted_not_completed_ = 0;
+  EngineStats stats_;
 
   bool startup_complete_ = false;
   std::exception_ptr startup_error_;
