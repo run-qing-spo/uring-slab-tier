@@ -28,6 +28,7 @@ PRIMARY_BYTES="${PRIMARY_BYTES:-67108864}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 DISK_BYTES="${DISK_BYTES:-137438953472}"
 READY_TIMEOUT="${SERVER_READY_TIMEOUT_SECONDS:-240}"
+MONITOR_MODE="${VLLM_TIERING_MONITOR_MODE:-memory}"
 
 ARM_DIR="$RESULTS_ROOT/qps-$QPS/$ARM_ID-$BACKEND"
 PROMPTS_WARMUP="$RESULTS_ROOT/prompts-warmup.jsonl"
@@ -36,6 +37,7 @@ PROMPTS_MEASUREMENT="$RESULTS_ROOT/prompts-measurement.jsonl"
 SERVER_LOG="$ARM_DIR/server.log"
 FS_ROOT="$ARM_DIR/fs-data"
 SLAB_PATH="$ARM_DIR/uring-slab.bin"
+MONITOR_PATH="${VLLM_TIERING_MONITOR_PATH:-$ARM_DIR/tiering-monitor.jsonl}"
 SERVER_PID=""
 mkdir -p "$ARM_DIR"
 
@@ -82,7 +84,8 @@ KV_CONFIG=$(printf '%s' \
   exec env PYTHONHASHSEED=0 \
     PYTHONPATH="$VLLM_REPO:$REPO" \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    VLLM_SERVER_DEV_MODE=1 VLLM_TIERING_MONITOR_MODE=memory \
+    VLLM_SERVER_DEV_MODE=1 VLLM_TIERING_MONITOR_MODE="$MONITOR_MODE" \
+    VLLM_TIERING_MONITOR_PATH="$MONITOR_PATH" \
     taskset -c "$CPU_AFFINITY" "$PYTHON" -m vllm.entrypoints.cli.main serve \
       "$MODEL" --port "$PORT" --served-model-name "$MODEL_NAME" \
       --max-model-len 2048 --gpu-memory-utilization 0.90 --dtype float16 \
