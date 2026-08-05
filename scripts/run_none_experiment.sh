@@ -30,6 +30,7 @@ configure_experiment() {
   PROMPT_TOKENS="${PROMPT_TOKENS:-128}"
   OUTPUT_TOKENS="${OUTPUT_TOKENS:-1}"
   CLIENT_TIMEOUT_SECONDS="${CLIENT_TIMEOUT_SECONDS:-120}"
+  ASYNC_FLUSH_TIMEOUT_SECONDS="${ASYNC_FLUSH_TIMEOUT_SECONDS:-3}"
 
   RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
   RESULTS_ROOT="${RESULTS_ROOT:-$PWD/results/none/$RUN_ID}"
@@ -238,8 +239,10 @@ sample_server_metrics() {
 
 end_measurement_window() {
   local concurrency="$1"
+  local window_id="none-c$concurrency"
   local summary="$SERVER_POINT_DIR/server-window-summary.json"
   local temporary="$summary.tmp"
+  local deadline
 
   if ! curl --fail --silent --show-error \
     --request POST \
@@ -250,11 +253,24 @@ end_measurement_window() {
   fi
   if ! "$VLLM_PYTHON" -c \
     'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); assert data["window_id"] == sys.argv[2]' \
-    "$temporary" "none-c$concurrency"; then
+    "$temporary" "$window_id"; then
     unlink "$temporary" 2>/dev/null || true
     return 1
   fi
   mv "$temporary" "$summary"
+
+  # end_window 的 JSONL 写入是异步的；summary 位于同一 FIFO 的末尾，
+  # 因而看到它时，本窗口此前排队的请求记录也已经完成写入。
+  deadline=$((SECONDS + ASYNC_FLUSH_TIMEOUT_SECONDS))
+  while ! grep --fixed-strings --quiet \
+    "\"window_id\":\"$window_id\"" \
+    "$SERVER_POINT_DIR"/tiering-monitor.*.jsonl 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "等待 async JSONL 窗口汇总超时：window_id=$window_id" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
   echo "正式监控窗口已结束：concurrency=$concurrency，汇总=$summary"
 }
 
